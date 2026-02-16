@@ -14,7 +14,7 @@ import os
 
 logger = logging.getLogger(__name__)
 
-DATA_FILE = '../../Desktop/20botL15/schedule_data.json'  # файл для хранения спарсенных данных
+DATA_FILE = 'schedule_data.json'  # файл будет создаваться в той же директории
 
 
 class ExcelParser:
