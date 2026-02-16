@@ -819,6 +819,35 @@ async def cmd_week(message: types.Message, state: FSMContext):
 
     await message.answer(response, parse_mode="HTML")
 
+# Добавьте где-нибудь рядом с другими админскими командами (после /users например)
+
+@dp.message(Command("drop"))
+async def cmd_drop_bot(message: types.Message):
+    """Команда для остановки бота (только для админов)"""
+    if not access_control.is_admin(message.from_user.id):
+        await message.answer("⛔ Эта команда доступна только администратору.")
+        return
+
+    # Отправляем подтверждение
+    await message.answer(
+        "🛑 <b>Бот останавливается...</b>\n\n"
+        "Команда выполнена. Бот будет перезапущен автоматически через систему.",
+        parse_mode="HTML"
+    )
+
+    # Логируем действие
+    await bot_logger.log_action(
+        message.from_user.username or str(message.from_user.id),
+        f"👑 [ADMIN] Инициировал остановку бота командой /drop"
+    )
+
+    # Даем время на отправку сообщения
+    await asyncio.sleep(1)
+
+    # Останавливаем бота (завершаем процесс)
+    logger.warning(f"Бот остановлен командой /drop от админа {message.from_user.id}")
+    os._exit(0)  # Принудительное завершение процесса
+
 @dp.message(Command("whoisnow"))
 async def cmd_whoisnow(message: types.Message, state: FSMContext):
     """Команда: кто сейчас на смене"""
