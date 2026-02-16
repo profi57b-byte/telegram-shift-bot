@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  shift-bot:
+    build: .
+    container_name: telegram-shift-bot
+    restart: unless-stopped
+    volumes:
+      # Монтирование Excel файла (только для чтения)
+      - ./Webcaster__Clients_Support_График_L1_5.xlsx:/app/Webcaster__Clients_Support_График_L1_5.xlsx:ro
+      # Директория для логов
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    environment:
+      # Часовой пояс (настройте под свой регион)
+      - TZ=Europe/Moscow
+    # Опционально: ограничение ресурсов
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
