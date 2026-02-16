@@ -1,5 +1,7 @@
 """
 Модуль для работы с Excel файлом графика смен.
+При инициализации парсит все листы и сохраняет данные в JSON-файл.
+Все последующие запросы обрабатываются из загруженных данных (в памяти).
 """
 import pandas as pd
 import json
@@ -9,19 +11,18 @@ import calendar
 from pathlib import Path
 import time
 import os
-import re
 
 logger = logging.getLogger(__name__)
 
+DATA_FILE = 'schedule_data.json'  # файл будет создаваться в той же директории
+
 
 class ExcelParser:
-    """Парсер Excel файла с графиком смен"""
-
-    def __init__(self, file_path):
+    def __init__(self, file_path, json_path=DATA_FILE):
         self.file_path = file_path
-        self.json_path = 'schedule_data.json'
+        self.json_path = json_path
         self.employees = []
-        self.schedule_data = {}
+        self.schedule_data = {}      # ключ: дата (строка "YYYY-MM-DD"), значение: список смен
         self.last_update_time = 0
         self._load_or_parse()
 
@@ -32,101 +33,19 @@ class ExcelParser:
                 json_mtime = os.path.getmtime(self.json_path)
                 excel_mtime = os.path.getmtime(self.file_path)
                 if json_mtime > excel_mtime:
+                    # JSON свежее Excel, просто загружаем
                     self._load_from_json()
                     logger.info("Данные загружены из JSON-файла")
                     return
+            # Если JSON нет или он устарел, парсим Excel
             self._parse_all_and_save()
         except Exception as e:
             logger.error(f"Ошибка в _load_or_parse: {e}")
+            # В случае ошибки пытаемся загрузить из JSON
             if os.path.exists(self.json_path):
                 self._load_from_json()
             else:
                 self._parse_all_and_save()
-
-    def _load_employees_from_service_sheet(self):
-        """Загружает список сотрудников из листа 'Служебный лист 2'"""
-        try:
-            # Пробуем прочитать лист "Служебный лист 2"
-            df = pd.read_excel(self.file_path, sheet_name='Служебный лист 2')
-            logger.info(f"Прочитан лист 'Служебный лист 2', колонки: {list(df.columns)}")
-
-            # Ищем колонку "Сотрудники"
-            employees = []
-
-            # Проверяем все колонки
-            for col in df.columns:
-                col_str = str(col).strip()
-                logger.info(f"Проверяем колонку: '{col_str}'")
-
-                # Если колонка называется "Сотрудники"
-                if 'Сотрудники' in col_str or 'сотрудники' in col_str.lower():
-                    employees = df[col].dropna().tolist()
-                    logger.info(f"Найдена колонка 'Сотрудники', получено {len(employees)} записей")
-                    break
-
-            # Если не нашли колонку "Сотрудники", берем первую непустую колонку
-            if not employees:
-                for col in df.columns:
-                    if df[col].notna().any():
-                        employees = df[col].dropna().tolist()
-                        logger.info(f"Колонка 'Сотрудники' не найдена, используем первую колонку '{col}', получено {len(employees)} записей")
-                        break
-
-            # Очищаем имена
-            self.employees = []
-            for emp in employees:
-                emp_str = str(emp).strip()
-                # Пропускаем пустые строки и служебные записи
-                if emp_str and emp_str not in ('nan', 'None', '', 'Сотрудники'):
-                    # Проверяем, что это не заголовок и не сумма
-                    if not emp_str.startswith('Итого') and not emp_str.startswith('Всего'):
-                        self.employees.append(emp_str)
-
-            logger.info(f"Загружено {len(self.employees)} сотрудников: {self.employees[:5]}")
-
-        except Exception as e:
-            logger.error(f"Ошибка загрузки списка сотрудников: {e}")
-            self.employees = []
-
-    def _find_columns(self, df):
-        """Находит колонки с датой, временем и ответственным"""
-        date_col = None
-        time_col = None
-        emp_col = None
-
-        # Варианты названий колонок
-        date_variants = ['дата', 'date', 'день', 'day', 'число']
-        time_variants = ['время', 'time']
-        emp_variants = ['ответственный', 'responsible', 'сотрудник', 'employee', 'фио']
-
-        for col in df.columns:
-            col_str = str(col).lower().strip()
-
-            # Поиск колонки с датой
-            if not date_col:
-                for variant in date_variants:
-                    if variant in col_str:
-                        date_col = col
-                        logger.info(f"Найдена колонка даты: '{col}'")
-                        break
-
-            # Поиск колонки с временем
-            if not time_col:
-                for variant in time_variants:
-                    if variant in col_str:
-                        time_col = col
-                        logger.info(f"Найдена колонка времени: '{col}'")
-                        break
-
-            # Поиск колонки с ответственным
-            if not emp_col:
-                for variant in emp_variants:
-                    if variant in col_str:
-                        emp_col = col
-                        logger.info(f"Найдена колонка ответственного: '{col}'")
-                        break
-
-        return date_col, time_col, emp_col
 
     def _parse_all_and_save(self):
         """Парсит все листы Excel и сохраняет в JSON."""
@@ -136,28 +55,59 @@ class ExcelParser:
                 logger.error(f"Excel файл не найден: {self.file_path}")
                 return
 
-            # Сначала загружаем список сотрудников
-            self._load_employees_from_service_sheet()
-
             xl_file = pd.ExcelFile(self.file_path)
             all_sheets = xl_file.sheet_names
 
-            # Месяцы на русском
+            # Загружаем список сотрудников из листа "Служебный лист 2"
+            try:
+                service_df = pd.read_excel(self.file_path, sheet_name='Служебный лист 2')
+                # Ищем колонку "Сотрудники"
+                employee_col = None
+                for col in service_df.columns:
+                    if 'Сотрудники' in str(col):
+                        employee_col = col
+                        break
+
+                if employee_col:
+                    self.employees = service_df[employee_col].dropna().tolist()
+                else:
+                    # Если не нашли колонку "Сотрудники", берем первую колонку
+                    first_col = service_df.columns[0]
+                    self.employees = service_df[first_col].dropna().tolist()
+
+                # Очистка от возможных NaN и пустых строк
+                self.employees = [str(e).strip() for e in self.employees if str(e).strip()]
+                logger.info(f"Загружено {len(self.employees)} сотрудников")
+            except Exception as e:
+                logger.error(f"Ошибка загрузки списка сотрудников: {e}")
+                self.employees = []
+
+            # Проходим по всем листам, кроме служебных
             month_names_ru = {
                 'Январь': 1, 'Февраль': 2, 'Март': 3, 'Апрель': 4,
                 'Май': 5, 'Июнь': 6, 'Июль': 7, 'Август': 8,
                 'Сентябрь': 9, 'Октябрь': 10, 'Ноябрь': 11, 'Декабрь': 12
             }
 
-            schedule = {}
+            schedule = {}  # временный словарь
 
             for sheet in all_sheets:
                 # Пропускаем служебные листы
-                if any(x in sheet.lower() for x in ['служебный', 'отчет', 'информация', 'тикеты']):
-                    logger.info(f"Пропускаем служебный лист: {sheet}")
+                if any(x in sheet for x in ['Служебный', 'Отчет', 'Информация', 'ТИКЕТЫ']):
                     continue
 
-                logger.info(f"Обрабатываем лист: {sheet}")
+                # Определяем месяц и год из названия листа (например, "Февраль 26")
+                parts = sheet.split()
+                if len(parts) != 2:
+                    continue
+                month_name, year_short = parts[0], parts[1]
+                if month_name not in month_names_ru:
+                    continue
+                month_num = month_names_ru[month_name]
+                try:
+                    year = 2000 + int(year_short) if len(year_short) == 2 else int(year_short)
+                except:
+                    continue
 
                 # Читаем лист
                 try:
@@ -166,52 +116,58 @@ class ExcelParser:
                     logger.error(f"Не удалось прочитать лист {sheet}: {e}")
                     continue
 
-                # Находим колонки
-                date_col, time_col, emp_col = self._find_columns(df)
+                # Определяем колонки (предполагаем, что они называются стандартно)
+                date_col = None
+                emp_col = None
+                time_col = None
+                for col in df.columns:
+                    col_lower = str(col).lower()
+                    if 'дата' in col_lower:
+                        date_col = col
+                    elif 'ответственный' in col_lower:
+                        emp_col = col
+                    elif 'время' in col_lower:
+                        time_col = col
 
-                if not date_col or not time_col or not emp_col:
-                    logger.warning(f"В листе {sheet} не найдены нужные колонки")
-                    logger.warning(f"Доступные колонки: {list(df.columns)}")
+                if not date_col or not emp_col or not time_col:
+                    logger.warning(f"В листе {sheet} не найдены нужные колонки, пропускаем")
                     continue
 
                 # Проходим по строкам
+                current_date = None
                 for idx, row in df.iterrows():
-                    # Получаем дату
+                    # Проверяем дату
                     date_val = row.get(date_col)
-                    if pd.isna(date_val):
-                        continue
-
-                    # Преобразуем дату
-                    try:
-                        if isinstance(date_val, (datetime, pd.Timestamp)):
+                    if pd.notna(date_val):
+                        # преобразуем в datetime, если возможно
+                        if isinstance(date_val, datetime):
                             current_date = date_val
+                        elif isinstance(date_val, pd.Timestamp):
+                            current_date = date_val.to_pydatetime()
                         else:
-                            current_date = pd.to_datetime(date_val)
+                            # попытка распарсить строку
+                            try:
+                                current_date = pd.to_datetime(date_val).to_pydatetime()
+                            except:
+                                current_date = None
 
-                        if isinstance(current_date, pd.Timestamp):
-                            current_date = current_date.to_pydatetime()
-                    except Exception as e:
-                        logger.debug(f"Ошибка преобразования даты: {e}")
+                    if current_date is None:
                         continue
 
-                    # Получаем время и ответственного
-                    time_val = row.get(time_col)
+                    # Проверяем, что есть ответственный и время
                     emp_val = row.get(emp_col)
-
-                    if pd.isna(time_val) or pd.isna(emp_val):
+                    time_val = row.get(time_col)
+                    if pd.isna(emp_val) or pd.isna(time_val):
                         continue
 
-                    time_str = str(time_val).strip()
                     emp_str = str(emp_val).strip()
-
-                    if not time_str or not emp_str or emp_str.lower() in ('nan', 'none', '', 'ответственный'):
+                    time_str = str(time_val).strip()
+                    if not emp_str or not time_str or emp_str in ('nan', 'None', 'Ответственный'):
                         continue
-
-                    # Проверяем формат времени
                     if ':' not in time_str or '-' not in time_str:
                         continue
 
-                    # Сохраняем запись
+                    # Формируем ключ даты
                     date_key = current_date.strftime('%Y-%m-%d')
                     if date_key not in schedule:
                         schedule[date_key] = []
@@ -221,28 +177,18 @@ class ExcelParser:
                     })
 
             self.schedule_data = schedule
-
             # Сохраняем в JSON
             with open(self.json_path, 'w', encoding='utf-8') as f:
                 json.dump({
                     'employees': self.employees,
                     'schedule': self.schedule_data
                 }, f, ensure_ascii=False, indent=2)
-
             self.last_update_time = time.time()
-            logger.info(f"Парсинг завершён. Загружено сотрудников: {len(self.employees)}")
-            logger.info(f"Дней с данными: {len(self.schedule_data)}")
-
-            if self.employees:
-                logger.info(f"Примеры сотрудников: {self.employees[:5]}")
-            if self.schedule_data:
-                sample_date = next(iter(self.schedule_data))
-                logger.info(f"Пример данных за {sample_date}: {len(self.schedule_data[sample_date])} записей")
+            logger.info(f"Парсинг завершён. Сохранено {len(self.schedule_data)} дней с данными.")
 
         except Exception as e:
             logger.error(f"Ошибка при парсинге Excel: {e}")
-            import traceback
-            traceback.print_exc()
+            # Если не удалось, пытаемся загрузить из JSON (если есть)
             if os.path.exists(self.json_path):
                 self._load_from_json()
 
@@ -255,8 +201,6 @@ class ExcelParser:
             self.schedule_data = data.get('schedule', {})
             self.last_update_time = time.time()
             logger.info(f"Данные загружены из {self.json_path}")
-            logger.info(f"Сотрудников: {len(self.employees)}")
-            logger.info(f"Дней с данными: {len(self.schedule_data)}")
         except Exception as e:
             logger.error(f"Ошибка загрузки из JSON: {e}")
             self.employees = []
@@ -267,19 +211,12 @@ class ExcelParser:
         self._parse_all_and_save()
 
     def get_employees(self):
-        """Возвращает список сотрудников"""
-        if not self.employees:
-            logger.warning("Список сотрудников пуст!")
-            # Пробуем перезагрузить
-            self._load_employees_from_service_sheet()
         return self.employees
 
     def get_schedule_for_date(self, date):
         """Получает расписание на конкретную дату"""
         date_key = date.strftime('%Y-%m-%d')
-        result = self.schedule_data.get(date_key, [])
-        logger.debug(f"get_schedule_for_date({date_key}): найдено {len(result)} записей")
-        return result
+        return self.schedule_data.get(date_key, [])
 
     def get_department_stats(self, year, month):
         """
@@ -507,11 +444,12 @@ class ExcelParser:
         week = {}
         for i in range(7):
             date = start_date + timedelta(days=i)
+            date_key = date.strftime('%Y-%m-%d')
             if employee_name:
                 shifts = self.get_employee_schedule(employee_name, date)
             else:
                 shifts = self.get_schedule_for_date(date)
-            week[date.strftime('%Y-%m-%d')] = {
+            week[date_key] = {
                 'date': date,
                 'weekday': date.weekday(),
                 'schedule': shifts
