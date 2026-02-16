@@ -131,9 +131,18 @@ async def access_check_middleware(handler, event: types.Message, data: dict):
 @dp.message.middleware()
 async def load_user_middleware(handler, event: types.Message, data: dict):
     """Middleware для загрузки данных пользователя"""
-    state: FSMContext = await data.get('state')
+    # Получаем state из data (он уже должен быть там от FSM middleware)
+    state: FSMContext = data.get('state')
+
     if not state:
-        state = dp.fsm.get_context(bot, event.chat.id, event.from_user.id)
+        # Если state нет, создаем новый
+        state = FSMContext(
+            storage=dp.storage,
+            key=dp.fsm.get_key(
+                chat_id=event.chat.id,
+                user_id=event.from_user.id
+            )
+        )
         data['state'] = state
 
     user_id = event.from_user.id
@@ -162,11 +171,6 @@ async def load_user_middleware(handler, event: types.Message, data: dict):
         # Если состояние не установлено, переходим в главное меню
         if current_state is None:
             await state.set_state(UserStates.main_menu)
-    elif current_state is None:
-        # Если нет данных в БД и состояние не установлено, отправляем на выбор имени
-        # Но только если это не системное сообщение
-        if event.text and not event.text.startswith('/'):
-            await state.set_state(UserStates.choosing_name)
 
     return await handler(event, data)
 
@@ -666,6 +670,7 @@ async def cmd_menu(message: types.Message, state: FSMContext):
 
 
 @dp.message(Command("today"))
+@dp.message(F.text == "📅 Сегодня")
 async def cmd_today(message: types.Message, state: FSMContext):
     """Команда: расписание на сегодня"""
     # Проверяем, есть ли имя в состоянии
@@ -673,14 +678,23 @@ async def cmd_today(message: types.Message, state: FSMContext):
     employee_name = user_data.get('employee_name')
 
     if not employee_name:
-        # Если имени нет, отправляем на выбор
-        await state.set_state(UserStates.choosing_name)
-        employees = excel_parser.get_employees()
-        await message.answer(
-            "⚠️ Сначала выберите ваше имя:",
-            reply_markup=get_name_keyboard(employees)
-        )
-        return
+        # Если имени нет, проверяем БД
+        user_db = await db.get_user(message.from_user.id)
+        if user_db and user_db.get('employee_name'):
+            employee_name = user_db['employee_name']
+            await state.update_data(employee_name=employee_name)
+        else:
+            # Отправляем на выбор имени
+            await state.set_state(UserStates.choosing_name)
+            employees = excel_parser.get_employees()
+            if employees:
+                await message.answer(
+                    "⚠️ Сначала выберите ваше имя:",
+                    reply_markup=get_name_keyboard(employees)
+                )
+            else:
+                await message.answer("⚠️ Список сотрудников не загружен. Попробуйте позже.")
+            return
 
     await state.set_state(UserStates.main_menu)
 
@@ -690,7 +704,7 @@ async def cmd_today(message: types.Message, state: FSMContext):
     )
 
     today = datetime.now()
-    schedule = excel_parser.get_schedule_for_date(today) or []
+    schedule = excel_parser.get_schedule_for_date(today)
     all_employees = excel_parser.get_employees()
 
     response = f"📅 <b>Расписание на {today.strftime('%d.%m.%Y')} ({_get_weekday(today)})</b>\n\n"
@@ -703,13 +717,32 @@ async def cmd_today(message: types.Message, state: FSMContext):
 
     await message.answer(response, parse_mode="HTML")
 
+
 @dp.message(Command("tomorrow"))
+@dp.message(F.text == "📅 Завтра")
 async def cmd_tomorrow(message: types.Message, state: FSMContext):
     """Команда: расписание на завтра"""
-    await state.set_state(UserStates.main_menu)
-
     user_data = await state.get_data()
     employee_name = user_data.get('employee_name')
+
+    if not employee_name:
+        user_db = await db.get_user(message.from_user.id)
+        if user_db and user_db.get('employee_name'):
+            employee_name = user_db['employee_name']
+            await state.update_data(employee_name=employee_name)
+        else:
+            await state.set_state(UserStates.choosing_name)
+            employees = excel_parser.get_employees()
+            if employees:
+                await message.answer(
+                    "⚠️ Сначала выберите ваше имя:",
+                    reply_markup=get_name_keyboard(employees)
+                )
+            else:
+                await message.answer("⚠️ Список сотрудников не загружен.")
+            return
+
+    await state.set_state(UserStates.main_menu)
 
     await bot_logger.log_action(
         message.from_user.username or str(message.from_user.id),
@@ -717,22 +750,45 @@ async def cmd_tomorrow(message: types.Message, state: FSMContext):
     )
 
     tomorrow = datetime.now() + timedelta(days=1)
-    schedule = excel_parser.get_schedule_for_date(tomorrow) or []
+    schedule = excel_parser.get_schedule_for_date(tomorrow)
     all_employees = excel_parser.get_employees()
 
     response = f"📅 <b>Расписание на {tomorrow.strftime('%d.%m.%Y')} ({_get_weekday(tomorrow)})</b>\n\n"
-    response += _format_full_day_schedule(all_employees, schedule, employee_name)
+
+    if not schedule:
+        response += "Нет данных о сменах на завтра."
+    else:
+        formatted_schedule = _format_full_day_schedule(all_employees, schedule, employee_name)
+        response += formatted_schedule if formatted_schedule else "Нет данных о сменах."
 
     await message.answer(response, parse_mode="HTML")
 
 
 @dp.message(Command("week"))
+@dp.message(F.text == "📅 Неделя")
 async def cmd_week(message: types.Message, state: FSMContext):
     """Команда: расписание на неделю"""
-    await state.set_state(UserStates.main_menu)
-
     user_data = await state.get_data()
     employee_name = user_data.get('employee_name')
+
+    if not employee_name:
+        user_db = await db.get_user(message.from_user.id)
+        if user_db and user_db.get('employee_name'):
+            employee_name = user_db['employee_name']
+            await state.update_data(employee_name=employee_name)
+        else:
+            await state.set_state(UserStates.choosing_name)
+            employees = excel_parser.get_employees()
+            if employees:
+                await message.answer(
+                    "⚠️ Сначала выберите ваше имя:",
+                    reply_markup=get_name_keyboard(employees)
+                )
+            else:
+                await message.answer("⚠️ Список сотрудников не загружен.")
+            return
+
+    await state.set_state(UserStates.main_menu)
 
     await bot_logger.log_action(
         message.from_user.username or str(message.from_user.id),
@@ -743,18 +799,25 @@ async def cmd_week(message: types.Message, state: FSMContext):
     all_employees = excel_parser.get_employees()
 
     response = "📅 <b>Расписание на неделю</b>\n\n"
-
     weekdays_short = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+    has_data = False
 
     for i in range(7):
         date = today + timedelta(days=i)
-        schedule = excel_parser.get_schedule_for_date(date) or []
-        response += f"<b>{weekdays_short[date.weekday()]} {date.strftime('%d.%m')}</b>\n"
-        response += _format_full_day_schedule(all_employees, schedule, employee_name)
-        response += "\n"
+        schedule = excel_parser.get_schedule_for_date(date)
+        if schedule:
+            has_data = True
+            response += f"<b>{weekdays_short[date.weekday()]} {date.strftime('%d.%m')}</b>\n"
+            formatted = _format_full_day_schedule(all_employees, schedule, employee_name)
+            response += formatted + "\n\n"
+        else:
+            response += f"<b>{weekdays_short[date.weekday()]} {date.strftime('%d.%m')}</b>\n"
+            response += "   Нет данных\n\n"
+
+    if not has_data:
+        response = "📅 <b>Расписание на неделю</b>\n\nНет данных о сменах на ближайшую неделю."
 
     await message.answer(response, parse_mode="HTML")
-
 
 @dp.message(Command("whoisnow"))
 async def cmd_whoisnow(message: types.Message, state: FSMContext):

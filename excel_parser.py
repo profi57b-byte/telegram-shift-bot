@@ -262,7 +262,11 @@ class ExcelParser:
     def get_schedule_for_date(self, date):
         """Получает расписание на конкретную дату"""
         date_key = date.strftime('%Y-%m-%d')
-        return self.schedule_data.get(date_key, [])
+        result = self.schedule_data.get(date_key, [])
+        logger.info(f"get_schedule_for_date({date_key}): найдено {len(result)} записей")
+        if result:
+            logger.info(f"Пример: {result[0]}")
+        return result
 
     def get_department_stats(self, year, month):
         """
