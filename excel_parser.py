@@ -11,13 +11,21 @@ import calendar
 from pathlib import Path
 import time
 import os
+import glob
 
 logger = logging.getLogger(__name__)
 
 # DATA_FILE = 'schedule_data.json'  # файл будет создаваться в той же директории
 
 
-# В excel_parser.py, найдите метод __init__ и замените на:
+class ExcelParser:  # Убедитесь, что класс называется именно так
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.json_path = 'schedule_data.json'
+        self.employees = []
+        self.schedule_data = {}
+        self.last_update_time = 0
+        self._load_or_parse()
 
 def __init__(self, file_path):
     self.file_path = file_path  # используем переданное имя файла
