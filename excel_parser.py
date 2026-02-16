@@ -14,6 +14,7 @@ import os
 
 logger = logging.getLogger(__name__)
 
+# ИЗМЕНЕНО: абсолютный путь заменен на относительный
 DATA_FILE = 'schedule_data.json'  # файл будет создаваться в той же директории
 
 
@@ -28,53 +29,31 @@ class ExcelParser:
 
     def _load_or_parse(self):
         """Загружает данные из JSON, если файл существует и не устарел, иначе парсит Excel."""
-        try:
-            if os.path.exists(self.json_path) and os.path.exists(self.file_path):
-                json_mtime = os.path.getmtime(self.json_path)
-                excel_mtime = os.path.getmtime(self.file_path)
-                if json_mtime > excel_mtime:
-                    # JSON свежее Excel, просто загружаем
-                    self._load_from_json()
-                    logger.info("Данные загружены из JSON-файла")
-                    return
-            # Если JSON нет или он устарел, парсим Excel
-            self._parse_all_and_save()
-        except Exception as e:
-            logger.error(f"Ошибка в _load_or_parse: {e}")
-            # В случае ошибки пытаемся загрузить из JSON
-            if os.path.exists(self.json_path):
+        if os.path.exists(self.json_path):
+            # можно добавить проверку по времени изменения файла Excel относительно JSON
+            json_mtime = os.path.getmtime(self.json_path)
+            excel_mtime = os.path.getmtime(self.file_path)
+            if json_mtime > excel_mtime:
+                # JSON свежее Excel, просто загружаем
                 self._load_from_json()
-            else:
-                self._parse_all_and_save()
+                logger.info("Данные загружены из JSON-файла")
+                return
+        # Если JSON нет или он устарел, парсим Excel
+        self._parse_all_and_save()
 
     def _parse_all_and_save(self):
         """Парсит все листы Excel и сохраняет в JSON."""
-        logger.info(f"Начинаем полный парсинг Excel файла: {self.file_path}")
+        logger.info("Начинаем полный парсинг Excel файла...")
         try:
-            if not os.path.exists(self.file_path):
-                logger.error(f"Excel файл не найден: {self.file_path}")
-                return
-
             xl_file = pd.ExcelFile(self.file_path)
             all_sheets = xl_file.sheet_names
 
             # Загружаем список сотрудников из листа "Служебный лист 2"
             try:
                 service_df = pd.read_excel(self.file_path, sheet_name='Служебный лист 2')
-                # Ищем колонку "Сотрудники"
-                employee_col = None
-                for col in service_df.columns:
-                    if 'Сотрудники' in str(col):
-                        employee_col = col
-                        break
-
-                if employee_col:
-                    self.employees = service_df[employee_col].dropna().tolist()
-                else:
-                    # Если не нашли колонку "Сотрудники", берем первую колонку
-                    first_col = service_df.columns[0]
-                    self.employees = service_df[first_col].dropna().tolist()
-
+                # Предполагаем, что первая колонка содержит имена
+                first_col = service_df.columns[0]
+                self.employees = service_df[first_col].dropna().tolist()
                 # Очистка от возможных NaN и пустых строк
                 self.employees = [str(e).strip() for e in self.employees if str(e).strip()]
                 logger.info(f"Загружено {len(self.employees)} сотрудников")
@@ -213,6 +192,7 @@ class ExcelParser:
     def get_employees(self):
         return self.employees
 
+    # ДОБАВЛЕН: недостающий метод
     def get_schedule_for_date(self, date):
         """Получает расписание на конкретную дату"""
         date_key = date.strftime('%Y-%m-%d')
