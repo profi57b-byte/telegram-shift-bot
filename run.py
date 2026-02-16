@@ -6,31 +6,27 @@ import os
 import sys
 from pathlib import Path
 
-# Проверка наличия .env файла
-env_file = Path('.env')
-if not env_file.exists():
-    print("❌ Файл .env не найден!")
-    print("📝 Создайте файл .env на основе .env.example:")
-    print("   cp .env.example .env")
-    print("   Затем отредактируйте .env и укажите BOT_TOKEN")
-    sys.exit(1)
-
-# Загрузка переменных окружения
-from dotenv import load_dotenv
-load_dotenv()
+# Загрузка переменных окружения (опционально, если файл .env есть)
+try:
+    from dotenv import load_dotenv
+    if Path('.env').exists():
+        load_dotenv()
+        print("✅ Загружены переменные из .env")
+except ImportError:
+    print("⚠️ dotenv не установлен, пропускаем загрузку из .env")
 
 # Проверка наличия токена
 bot_token = os.getenv('BOT_TOKEN')
-if not bot_token or bot_token == 'your_bot_token_here':
-    print("❌ BOT_TOKEN не настроен в файле .env")
-    print("📝 Получите токен у @BotFather и укажите его в .env файле")
+if not bot_token:
+    print("❌ BOT_TOKEN не задан в переменных окружения!")
+    print("📝 Укажите BOT_TOKEN в переменных окружения на хостинге")
     sys.exit(1)
 
 # Проверка наличия Excel файла
-excel_file = os.getenv('EXCEL_FILE', 'Webcaster__Clients_Support_График_L1_5.xlsx')
+excel_file = os.getenv('EXCEL_FILE', 'graph.xlsx')
 if not Path(excel_file).exists():
     print(f"❌ Excel файл '{excel_file}' не найден!")
-    print(f"📝 Поместите файл в текущую директорию или укажите правильный путь в .env")
+    print(f"📝 Поместите файл в текущую директорию или укажите правильный путь")
     sys.exit(1)
 
 print("✅ Все проверки пройдены")
