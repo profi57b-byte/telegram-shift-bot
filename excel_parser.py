@@ -14,17 +14,18 @@ import os
 
 logger = logging.getLogger(__name__)
 
-DATA_FILE = 'schedule_data.json'  # файл будет создаваться в той же директории
+# DATA_FILE = 'schedule_data.json'  # файл будет создаваться в той же директории
 
 
-class ExcelParser:
-    def __init__(self, file_path, json_path=DATA_FILE):
-        self.file_path = file_path
-        self.json_path = json_path
-        self.employees = []
-        self.schedule_data = {}      # ключ: дата (строка "YYYY-MM-DD"), значение: список смен
-        self.last_update_time = 0
-        self._load_or_parse()
+# В excel_parser.py, найдите метод __init__ и замените на:
+
+def __init__(self, file_path):
+    self.file_path = file_path  # используем переданное имя файла
+    self.json_path = 'schedule_data.json'
+    self.employees = []
+    self.schedule_data = {}      # ключ: дата (строка "YYYY-MM-DD"), значение: список смен
+    self.last_update_time = 0
+    self._load_or_parse()
 
     def _load_or_parse(self):
         """Загружает данные из JSON, если файл существует и не устарел, иначе парсит Excel."""

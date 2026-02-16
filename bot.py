@@ -22,8 +22,8 @@ from access_control import AccessControl
 
 # Конфигурация
 BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN')
-LOG_CHAT_ID = os.getenv('LOG_CHAT_ID', 'YOUR_LOG_CHAT_ID')
-EXCEL_FILE = os.getenv('EXCEL_FILE', 'Webcaster__Clients_Support_График_L1_5.xlsx')
+LOG_CHAT_ID = '-5242231135'  # Ваш ID чата для логов
+EXCEL_FILE = os.getenv('EXCEL_FILE', 'graph.xlsx')
 
 # Инициализация
 bot = Bot(token=BOT_TOKEN)
@@ -50,6 +50,35 @@ class UserStates(StatesGroup):
     choosing_daily_remind_time = State()
     director_choosing_employee = State()
 
+
+# Функция поиска Excel файла
+def find_excel_file():
+    """Ищет любой Excel файл в текущей директории"""
+    # Сначала проверяем переменную окружения
+    env_file = os.getenv('EXCEL_FILE')
+    if env_file and Path(env_file).exists():
+        return env_file
+
+    # Ищем .xlsx файлы
+    xlsx_files = glob.glob("*.xlsx")
+    if xlsx_files:
+        return xlsx_files[0]
+
+    # Ищем .xls файлы
+    xls_files = glob.glob("*.xls")
+    if xls_files:
+        return xls_files[0]
+
+    return None
+
+# Находим Excel файл
+EXCEL_FILE = find_excel_file()
+if not EXCEL_FILE:
+    print("❌ КРИТИЧЕСКАЯ ОШИБКА: Не найден Excel файл!")
+    print("📝 Поместите файл графика (.xlsx или .xls) в директорию бота")
+    sys.exit(1)
+
+print(f"📊 Загружен Excel файл: {EXCEL_FILE}")
 
 # Middleware для проверки доступа
 @dp.message.middleware()
