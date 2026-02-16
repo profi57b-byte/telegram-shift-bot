@@ -15,10 +15,10 @@ import glob
 
 logger = logging.getLogger(__name__)
 
-# DATA_FILE = 'schedule_data.json'  # файл будет создаваться в той же директории
 
+class ExcelParser:
+    """Парсер Excel файла с графиком смен"""
 
-class ExcelParser:  # Убедитесь, что класс называется именно так
     def __init__(self, file_path):
         self.file_path = file_path
         self.json_path = 'schedule_data.json'
@@ -27,32 +27,35 @@ class ExcelParser:  # Убедитесь, что класс называется
         self.last_update_time = 0
         self._load_or_parse()
 
-def __init__(self, file_path):
-    self.file_path = file_path  # используем переданное имя файла
-    self.json_path = 'schedule_data.json'
-    self.employees = []
-    self.schedule_data = {}      # ключ: дата (строка "YYYY-MM-DD"), значение: список смен
-    self.last_update_time = 0
-    self._load_or_parse()
-
     def _load_or_parse(self):
         """Загружает данные из JSON, если файл существует и не устарел, иначе парсит Excel."""
-        if os.path.exists(self.json_path):
-            # можно добавить проверку по времени изменения файла Excel относительно JSON
-            json_mtime = os.path.getmtime(self.json_path)
-            excel_mtime = os.path.getmtime(self.file_path)
-            if json_mtime > excel_mtime:
-                # JSON свежее Excel, просто загружаем
+        try:
+            if os.path.exists(self.json_path) and os.path.exists(self.file_path):
+                json_mtime = os.path.getmtime(self.json_path)
+                excel_mtime = os.path.getmtime(self.file_path)
+                if json_mtime > excel_mtime:
+                    # JSON свежее Excel, просто загружаем
+                    self._load_from_json()
+                    logger.info("Данные загружены из JSON-файла")
+                    return
+            # Если JSON нет или он устарел, парсим Excel
+            self._parse_all_and_save()
+        except Exception as e:
+            logger.error(f"Ошибка в _load_or_parse: {e}")
+            # В случае ошибки пытаемся загрузить из JSON
+            if os.path.exists(self.json_path):
                 self._load_from_json()
-                logger.info("Данные загружены из JSON-файла")
-                return
-        # Если JSON нет или он устарел, парсим Excel
-        self._parse_all_and_save()
+            else:
+                self._parse_all_and_save()
 
     def _parse_all_and_save(self):
         """Парсит все листы Excel и сохраняет в JSON."""
-        logger.info("Начинаем полный парсинг Excel файла...")
+        logger.info(f"Начинаем полный парсинг Excel файла: {self.file_path}")
         try:
+            if not os.path.exists(self.file_path):
+                logger.error(f"Excel файл не найден: {self.file_path}")
+                return
+
             xl_file = pd.ExcelFile(self.file_path)
             all_sheets = xl_file.sheet_names
 
@@ -198,7 +201,13 @@ def __init__(self, file_path):
         self._parse_all_and_save()
 
     def get_employees(self):
+        """Возвращает список сотрудников"""
         return self.employees
+
+    def get_schedule_for_date(self, date):
+        """Получает расписание на конкретную дату"""
+        date_key = date.strftime('%Y-%m-%d')
+        return self.schedule_data.get(date_key, [])
 
     def get_department_stats(self, year, month):
         """
@@ -426,12 +435,11 @@ def __init__(self, file_path):
         week = {}
         for i in range(7):
             date = start_date + timedelta(days=i)
-            date_key = date.strftime('%Y-%m-%d')
             if employee_name:
                 shifts = self.get_employee_schedule(employee_name, date)
             else:
                 shifts = self.get_schedule_for_date(date)
-            week[date_key] = {
+            week[date.strftime('%Y-%m-%d')] = {
                 'date': date,
                 'weekday': date.weekday(),
                 'schedule': shifts
