@@ -81,8 +81,8 @@ if not EXCEL_FILE:
 
 print(f"📊 Загружен Excel файл: {EXCEL_FILE}")
 
+
 # Middleware для проверки доступа
-@dp.message.middleware()
 @dp.message.middleware()
 async def access_check_middleware(handler, event: types.Message, data: dict):
     """Middleware для проверки доступа к боту"""
@@ -92,7 +92,7 @@ async def access_check_middleware(handler, event: types.Message, data: dict):
     if access_control.is_admin(user_id):
         return await handler(event, data)
 
-    # Проверяем, является ли пользователь руководителем (доступ автоматически)
+    # Проверяем, является ли пользователь руководителем
     if await access_control.is_director(user_id):
         return await handler(event, data)
 
@@ -130,29 +130,44 @@ async def access_check_middleware(handler, event: types.Message, data: dict):
 
 @dp.message.middleware()
 async def load_user_middleware(handler, event: types.Message, data: dict):
-    state: FSMContext = data.get('state')
-    if state:
-        user_id = event.from_user.id
-        # Если это директор, не загружаем из БД users, а просто устанавливаем флаг
-        is_director = await access_control.is_director(user_id)
-        if is_director:
-            current_state = await state.get_state()
-            if current_state != UserStates.choosing_name:
-                await state.update_data(is_director=True)
-                if current_state is None:
-                    await state.set_state(UserStates.main_menu)
-            return await handler(event, data)
+    """Middleware для загрузки данных пользователя"""
+    state: FSMContext = await data.get('state')
+    if not state:
+        state = dp.fsm.get_context(bot, event.chat.id, event.from_user.id)
+        data['state'] = state
 
-        # Для обычных пользователей – загружаем из БД
-        user_data_db = await db.get_user(user_id)
-        if user_data_db:
-            current_state = await state.get_state()
-            if current_state != UserStates.choosing_name:
-                current_data = await state.get_data()
-                if not current_data.get('employee_name') and user_data_db['employee_name']:
-                    await state.update_data(employee_name=user_data_db['employee_name'])
-                if current_state is None:
-                    await state.set_state(UserStates.main_menu)
+    user_id = event.from_user.id
+
+    # Получаем текущее состояние
+    current_state = await state.get_state()
+
+    # Проверяем, не находится ли пользователь в процессе выбора имени
+    if current_state == UserStates.choosing_name:
+        return await handler(event, data)
+
+    # Проверяем, является ли пользователь директором
+    is_director = await access_control.is_director(user_id)
+    if is_director:
+        await state.update_data(is_director=True)
+        if current_state is None:
+            await state.set_state(UserStates.main_menu)
+        return await handler(event, data)
+
+    # Загружаем данные из БД
+    user_data_db = await db.get_user(user_id)
+    if user_data_db and user_data_db.get('employee_name'):
+        # Сохраняем имя в состояние
+        await state.update_data(employee_name=user_data_db['employee_name'])
+
+        # Если состояние не установлено, переходим в главное меню
+        if current_state is None:
+            await state.set_state(UserStates.main_menu)
+    elif current_state is None:
+        # Если нет данных в БД и состояние не установлено, отправляем на выбор имени
+        # Но только если это не системное сообщение
+        if event.text and not event.text.startswith('/'):
+            await state.set_state(UserStates.choosing_name)
+
     return await handler(event, data)
 
 # Клавиатуры
@@ -653,10 +668,21 @@ async def cmd_menu(message: types.Message, state: FSMContext):
 @dp.message(Command("today"))
 async def cmd_today(message: types.Message, state: FSMContext):
     """Команда: расписание на сегодня"""
-    await state.set_state(UserStates.main_menu)
-
+    # Проверяем, есть ли имя в состоянии
     user_data = await state.get_data()
     employee_name = user_data.get('employee_name')
+
+    if not employee_name:
+        # Если имени нет, отправляем на выбор
+        await state.set_state(UserStates.choosing_name)
+        employees = excel_parser.get_employees()
+        await message.answer(
+            "⚠️ Сначала выберите ваше имя:",
+            reply_markup=get_name_keyboard(employees)
+        )
+        return
+
+    await state.set_state(UserStates.main_menu)
 
     await bot_logger.log_action(
         message.from_user.username or str(message.from_user.id),
@@ -668,10 +694,14 @@ async def cmd_today(message: types.Message, state: FSMContext):
     all_employees = excel_parser.get_employees()
 
     response = f"📅 <b>Расписание на {today.strftime('%d.%m.%Y')} ({_get_weekday(today)})</b>\n\n"
-    response += _format_full_day_schedule(all_employees, schedule, employee_name)
+
+    if not schedule:
+        response += "Нет данных о сменах на сегодня."
+    else:
+        formatted_schedule = _format_full_day_schedule(all_employees, schedule, employee_name)
+        response += formatted_schedule if formatted_schedule else "Нет данных о сменах."
 
     await message.answer(response, parse_mode="HTML")
-
 
 @dp.message(Command("tomorrow"))
 async def cmd_tomorrow(message: types.Message, state: FSMContext):
@@ -1179,8 +1209,14 @@ async def process_name_selection(message: types.Message, state: FSMContext):
     """Обработка выбора имени сотрудника"""
     employees = excel_parser.get_employees()
 
+    # Проверяем, есть ли имя в списке
     if message.text in employees:
+        # Сохраняем имя в состояние
         await state.update_data(employee_name=message.text)
+
+        # Получаем обновленные данные состояния
+        user_data = await state.get_data()
+        logger.info(f"Сохраняем имя {message.text} для пользователя {message.from_user.id}")
 
         # Сохраняем в БД
         await db.save_user(
@@ -1195,11 +1231,16 @@ async def process_name_selection(message: types.Message, state: FSMContext):
             f"Выбрал имя: {message.text}"
         )
 
+        # Переходим в главное меню
         await state.set_state(UserStates.main_menu)
+
+        # Проверяем, является ли пользователь директором
+        is_director = await access_control.is_director(message.from_user.id)
+
         await message.answer(
             f"✅ Отлично, {message.text}!\n\n"
             f"Теперь вы можете использовать все функции бота:",
-            reply_markup=get_main_menu_keyboard()
+            reply_markup=get_main_menu_keyboard(is_director)
         )
     else:
         await message.answer(
