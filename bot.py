@@ -12,6 +12,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 import asyncio
+import pytz
 
 from pathlib import Path
 from datetime import datetime, timedelta, time
@@ -41,6 +42,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+MOSCOW_OFFSET = timedelta(hours=3)
+
+def moscow_now():
+    """Возвращает текущее московское время (UTC+3)."""
+    return datetime.now(timezone.utc) + MOSCOW_OFFSET
 
 # FSM States
 class UserStates(StatesGroup):
@@ -533,7 +539,11 @@ async def director_stats_show(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.edit_text("⚠️ Ошибка: сотрудник не выбран.")
         return
 
-    stats = excel_parser.get_employee_stats_for_month(employee_name, year, month)
+    stats = excel_parser.get_employee_stats_for_month(
+        employee_name, year, month,
+        current_date=moscow_now().date()
+    )
+
     if not stats:
         await callback.message.edit_text("⚠️ Статистика за этот месяц недоступна.")
         return
@@ -553,7 +563,7 @@ async def director_stats_show(callback: types.CallbackQuery, state: FSMContext):
         pay_month = month + 1
     pay_date = datetime(pay_year, pay_month, 5).date()
 
-    today = datetime.now().date()
+    today = moscow_now().date()  # ← было datetime.now().date()
     if pay_date < today:
         days_until_pay = 0
     else:
@@ -703,7 +713,7 @@ async def cmd_today(message: types.Message, state: FSMContext):
         "Запросил расписание на сегодня"
     )
 
-    today = datetime.now()
+    today = moscow_now()  # ← было datetime.now()
     schedule = excel_parser.get_schedule_for_date(today)
     all_employees = excel_parser.get_employees()
 
@@ -749,7 +759,7 @@ async def cmd_tomorrow(message: types.Message, state: FSMContext):
         "Запросил расписание на завтра"
     )
 
-    tomorrow = datetime.now() + timedelta(days=1)
+    tomorrow = moscow_now() + timedelta(days=1)   # ← было datetime.now() + ...
     schedule = excel_parser.get_schedule_for_date(tomorrow)
     all_employees = excel_parser.get_employees()
 
@@ -858,7 +868,7 @@ async def cmd_whoisnow(message: types.Message, state: FSMContext):
         "Запросил текущего дежурного"
     )
 
-    current_employee = excel_parser.get_current_employee()
+    current_employee = excel_parser.get_current_employee(current_time=moscow_now())
 
     if current_employee:
         response = f"👤 <b>Сейчас на смене:</b>\n\n{current_employee['name']}\n⏰ {current_employee['time']}"
@@ -1578,7 +1588,11 @@ async def process_stats_selection(callback: types.CallbackQuery, state: FSMConte
     year = int(year_str)
     month = int(month_str)
 
-    stats = excel_parser.get_employee_stats_for_month(employee_name, year, month)
+    stats = excel_parser.get_employee_stats_for_month(
+        employee_name, year, month,
+        current_date=moscow_now().date()
+    )
+
     if not stats:
         await callback.message.edit_text("⚠️ Статистика за этот месяц недоступна")
         return
@@ -1600,7 +1614,7 @@ async def process_stats_selection(callback: types.CallbackQuery, state: FSMConte
     pay_date = datetime(pay_year, pay_month, 5).date()
 
     # Дней до зарплаты (только если ещё не наступила)
-    today = datetime.now().date()
+    today = moscow_now().date()  # ← было datetime.now().date()
     if pay_date < today:
         days_until_pay = 0
     else:
@@ -1747,7 +1761,7 @@ async def reminder_checker():
     """Фоновая задача: раз в минуту проверяет, кому отправить напоминания."""
     while True:
         try:
-            now = datetime.now()
+            now = moscow_now()  # ← было datetime.now()
             current_time_str = now.strftime("%H:%M")
             current_hour = now.hour
             current_minute = now.minute

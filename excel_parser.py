@@ -306,7 +306,9 @@ class ExcelParser:
 
     def get_current_employee(self):
         """Определяет текущего дежурного с учётом объединения всех его смен на день."""
-        now = datetime.now()
+        if current_time is None:
+            current_time = datetime.now()  # fallback
+        now = current_time
         day_schedule = self.get_schedule_for_date(now)
         if not day_schedule:
             return None
@@ -362,6 +364,8 @@ class ExcelParser:
 
     def get_employee_stats_for_month(self, employee_name, year, month):
         """Статистика за месяц."""
+        if current_date is None:
+            current_date = datetime.now().date()
         days_in_month = calendar.monthrange(year, month)[1]
         total_hours = 0
         worked_days = set()
