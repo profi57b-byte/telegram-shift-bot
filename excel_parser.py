@@ -12,10 +12,18 @@ from pathlib import Path
 import time
 import os
 
+import pytz  # добавлено для работы с часовыми поясами
+
 logger = logging.getLogger(__name__)
 
 # ИЗМЕНЕНО: абсолютный путь заменен на относительный
 DATA_FILE = 'schedule_data.json'  # файл будет создаваться в той же директории
+
+
+def moscow_now():
+    """Возвращает текущее московское время (GMT+3) как наивный datetime."""
+    tz = pytz.timezone('Europe/Moscow')
+    return datetime.now(tz).replace(tzinfo=None)
 
 
 class ExcelParser:
@@ -192,7 +200,6 @@ class ExcelParser:
     def get_employees(self):
         return self.employees
 
-    # ДОБАВЛЕН: недостающий метод
     def get_schedule_for_date(self, date):
         """Получает расписание на конкретную дату"""
         date_key = date.strftime('%Y-%m-%d')
@@ -306,9 +313,7 @@ class ExcelParser:
 
     def get_current_employee(self):
         """Определяет текущего дежурного с учётом объединения всех его смен на день."""
-        if current_time is None:
-            current_time = datetime.now()  # fallback
-        now = current_time
+        now = moscow_now()  # изменено
         day_schedule = self.get_schedule_for_date(now)
         if not day_schedule:
             return None
@@ -364,12 +369,10 @@ class ExcelParser:
 
     def get_employee_stats_for_month(self, employee_name, year, month):
         """Статистика за месяц."""
-        if current_date is None:
-            current_date = datetime.now().date()
         days_in_month = calendar.monthrange(year, month)[1]
         total_hours = 0
         worked_days = set()
-        now = datetime.now()
+        now = moscow_now()  # изменено
 
         for day in range(1, days_in_month + 1):
             date = datetime(year, month, day)

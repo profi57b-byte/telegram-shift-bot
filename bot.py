@@ -4,19 +4,22 @@ Telegram бот для управления графиком смен L1.5
 """
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
+import asyncio
+import sys
+import glob
+from pathlib import Path
+from typing import Optional
+
+import pytz  # добавлено для работы с часовыми поясами
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-import asyncio
-import pytz
 
-from pathlib import Path
-from datetime import datetime, timedelta, time
-from typing import Optional
 from excel_parser import ExcelParser
 from logger import BotLogger
 from database import UserDatabase
@@ -42,11 +45,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MOSCOW_OFFSET = timedelta(hours=3)
 
 def moscow_now():
-    """Возвращает текущее московское время (UTC+3)."""
-    return datetime.now(timezone.utc) + MOSCOW_OFFSET
+    """Возвращает текущее московское время (GMT+3) как наивный datetime."""
+    tz = pytz.timezone('Europe/Moscow')
+    return datetime.now(tz).replace(tzinfo=None)
+
 
 # FSM States
 class UserStates(StatesGroup):
@@ -86,6 +90,24 @@ if not EXCEL_FILE:
     sys.exit(1)
 
 print(f"📊 Загружен Excel файл: {EXCEL_FILE}")
+
+# Middleware для логирования всех входящих сообщений (должен быть ПЕРВЫМ)
+@dp.message.middleware()
+async def log_all_messages_middleware(handler, event: types.Message, data: dict):
+    user_id = event.from_user.id
+    # Определяем роль пользователя
+    if access_control.is_admin(user_id):
+        role = "👑 АДМИН"
+    elif await access_control.is_director(user_id):
+        role = "🎯 РУКОВОДИТЕЛЬ"
+    else:
+        role = "👤 ПОЛЬЗОВАТЕЛЬ"
+
+    # Логируем сообщение (метод log_incoming_message должен быть в logger.py)
+    await bot_logger.log_incoming_message(event, role)
+
+    # Передаём управление дальше по цепочке middleware
+    return await handler(event, data)
 
 
 # Middleware для проверки доступа
@@ -211,7 +233,7 @@ def get_main_menu_keyboard(is_director=False):
 
 def get_date_keyboard(year=None, month=None):
     """Клавиатура выбора даты с навигацией по месяцам"""
-    today = datetime.now()
+    today = moscow_now()  # изменено
 
     if year is None or month is None:
         year = today.year
@@ -539,11 +561,7 @@ async def director_stats_show(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.edit_text("⚠️ Ошибка: сотрудник не выбран.")
         return
 
-    stats = excel_parser.get_employee_stats_for_month(
-        employee_name, year, month,
-        current_date=moscow_now().date()
-    )
-
+    stats = excel_parser.get_employee_stats_for_month(employee_name, year, month)
     if not stats:
         await callback.message.edit_text("⚠️ Статистика за этот месяц недоступна.")
         return
@@ -563,7 +581,7 @@ async def director_stats_show(callback: types.CallbackQuery, state: FSMContext):
         pay_month = month + 1
     pay_date = datetime(pay_year, pay_month, 5).date()
 
-    today = moscow_now().date()  # ← было datetime.now().date()
+    today = moscow_now().date()  # изменено
     if pay_date < today:
         days_until_pay = 0
     else:
@@ -657,12 +675,13 @@ async def cmd_help(message: types.Message):
         help_text += "/revoke [user_id] - Забрать доступ\n"
         help_text += "/makeadmin [user_id] - Назначить админа\n"
         help_text += "/users - Список пользователей\n"
+        help_text += "/broadcast [текст] - Отправить сообщение всем пользователям\n"
 
     help_text += (
         "\n🔹 <b>Возможности бота:</b>\n"
         "• Просмотр расписания на сегодня, завтра или любую дату\n"
         "• Информация о текущем дежурном\n"
-        "• Статистика работы и расчет зарплаты (160₽/час)\n\n"
+        "• Статистика работы и расчет зарплаты\n\n"
         "💡 Используйте кнопки меню для навигации!"
     )
     await message.answer(help_text, parse_mode="HTML")
@@ -713,7 +732,7 @@ async def cmd_today(message: types.Message, state: FSMContext):
         "Запросил расписание на сегодня"
     )
 
-    today = moscow_now()  # ← было datetime.now()
+    today = moscow_now()  # изменено
     schedule = excel_parser.get_schedule_for_date(today)
     all_employees = excel_parser.get_employees()
 
@@ -759,7 +778,7 @@ async def cmd_tomorrow(message: types.Message, state: FSMContext):
         "Запросил расписание на завтра"
     )
 
-    tomorrow = moscow_now() + timedelta(days=1)   # ← было datetime.now() + ...
+    tomorrow = moscow_now() + timedelta(days=1)  # изменено
     schedule = excel_parser.get_schedule_for_date(tomorrow)
     all_employees = excel_parser.get_employees()
 
@@ -805,7 +824,7 @@ async def cmd_week(message: types.Message, state: FSMContext):
         "Запросил расписание на неделю"
     )
 
-    today = datetime.now()
+    today = moscow_now()  # изменено
     all_employees = excel_parser.get_employees()
 
     response = "📅 <b>Расписание на неделю</b>\n\n"
@@ -858,6 +877,63 @@ async def cmd_drop_bot(message: types.Message):
     logger.warning(f"Бот остановлен командой /drop от админа {message.from_user.id}")
     os._exit(0)  # Принудительное завершение процесса
 
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message):
+    """Отправить сообщение всем пользователям (только для админа)"""
+    if not access_control.is_admin(message.from_user.id):
+        await message.answer("⛔ Эта команда доступна только администратору.")
+        return
+
+    # Получаем текст сообщения
+    text = message.text.replace('/broadcast', '', 1).strip()
+    if not text:
+        await message.answer(
+            "❌ <b>Неверный формат команды</b>\n\n"
+            "Используйте: <code>/broadcast [текст сообщения]</code>\n\n"
+            "Пример: <code>/broadcast Всем привет! Мы обновили бота.</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    await message.answer("🔄 Начинаю рассылку... Это может занять некоторое время.")
+
+    # Получаем всех пользователей с доступом
+    users = await access_control.get_all_users()
+    if not users:
+        await message.answer("📭 Нет пользователей для рассылки.")
+        return
+
+    success_count = 0
+    fail_count = 0
+
+    for user in users:
+        user_id = user['user_id']
+        try:
+            await bot.send_message(
+                user_id,
+                f"{text}",
+                parse_mode="HTML"
+            )
+            success_count += 1
+            # Небольшая задержка, чтобы не спамить Telegram API
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
+            fail_count += 1
+
+    # Логируем
+    await bot_logger.log_action(
+        message.from_user.username or str(message.from_user.id),
+        f"📢 Отправил рассылку. Успешно: {success_count}, ошибок: {fail_count}"
+    )
+
+    await message.answer(
+        f"✅ <b>Рассылка завершена</b>\n\n"
+        f"📨 Успешно отправлено: {success_count}\n"
+        f"❌ Ошибок: {fail_count}",
+        parse_mode="HTML"
+    )
+
 @dp.message(Command("whoisnow"))
 async def cmd_whoisnow(message: types.Message, state: FSMContext):
     """Команда: кто сейчас на смене"""
@@ -868,7 +944,7 @@ async def cmd_whoisnow(message: types.Message, state: FSMContext):
         "Запросил текущего дежурного"
     )
 
-    current_employee = excel_parser.get_current_employee(current_time=moscow_now())
+    current_employee = excel_parser.get_current_employee()
 
     if current_employee:
         response = f"👤 <b>Сейчас на смене:</b>\n\n{current_employee['name']}\n⏰ {current_employee['time']}"
@@ -1442,10 +1518,11 @@ async def change_name_button(message: types.Message, state: FSMContext):
 
 @dp.message(StateFilter(UserStates.main_menu), F.text == "◀️ Назад в меню")
 async def back_to_menu_button(message: types.Message, state: FSMContext):
-    """Возврат в главное меню"""
+    user_id = message.from_user.id
+    is_director = await access_control.is_director(user_id)
     await message.answer(
         "📋 Главное меню:",
-        reply_markup=get_main_menu_keyboard()
+        reply_markup=get_main_menu_keyboard(is_director)
     )
 
 @dp.message(F.text)
@@ -1465,11 +1542,13 @@ async def auto_start(message: types.Message, state: FSMContext):
     # Есть в БД – восстанавливаем
     await state.update_data(employee_name=user_data_db['employee_name'])
     await state.set_state(UserStates.main_menu)
+    user_id = message.from_user.id
+    is_director = await access_control.is_director(user_id)
     await message.answer(
         f"👋 С возвращением, {user_data_db['employee_name']}!\n\n"
         f"Повторите ваш запрос, пожалуйста.\n"
         f"Можете изменить настройки через меню ⚙️",
-        reply_markup=get_main_menu_keyboard()
+        reply_markup=get_main_menu_keyboard(is_director)
     )
 
 @dp.message(StateFilter(UserStates.main_menu))
@@ -1518,6 +1597,9 @@ async def process_date_selection(callback: types.CallbackQuery, state: FSMContex
     date_str = callback.data.split(":")[1]
     selected_date = datetime.strptime(date_str, "%Y-%m-%d")
 
+    user_id = callback.from_user.id
+    is_director = await access_control.is_director(user_id)
+
     user_data = await state.get_data()
     employee_name = user_data.get('employee_name')
 
@@ -1545,7 +1627,7 @@ async def process_date_selection(callback: types.CallbackQuery, state: FSMContex
         await state.set_state(UserStates.main_menu)
         await callback.message.answer(
             "📋 Главное меню:",
-            reply_markup=get_main_menu_keyboard()
+            reply_markup=get_main_menu_keyboard(is_director)
         )
         return
 
@@ -1560,7 +1642,7 @@ async def process_date_selection(callback: types.CallbackQuery, state: FSMContex
     await state.set_state(UserStates.main_menu)
     await callback.message.answer(
         "📋 Главное меню:",
-        reply_markup=get_main_menu_keyboard()
+        reply_markup=get_main_menu_keyboard(is_director)
     )
 
 
@@ -1570,11 +1652,12 @@ async def back_to_menu(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(UserStates.main_menu)
 
     await callback.message.edit_text("Возвращаемся в главное меню...")
+    user_id = callback.from_user.id
+    is_director = await access_control.is_director(user_id)
     await callback.message.answer(
         "📋 Главное меню:",
-        reply_markup=get_main_menu_keyboard()
+        reply_markup=get_main_menu_keyboard(is_director)
     )
-
 
 @dp.callback_query(F.data.startswith("stats:"))
 async def process_stats_selection(callback: types.CallbackQuery, state: FSMContext):
@@ -1588,11 +1671,7 @@ async def process_stats_selection(callback: types.CallbackQuery, state: FSMConte
     year = int(year_str)
     month = int(month_str)
 
-    stats = excel_parser.get_employee_stats_for_month(
-        employee_name, year, month,
-        current_date=moscow_now().date()
-    )
-
+    stats = excel_parser.get_employee_stats_for_month(employee_name, year, month)
     if not stats:
         await callback.message.edit_text("⚠️ Статистика за этот месяц недоступна")
         return
@@ -1614,7 +1693,7 @@ async def process_stats_selection(callback: types.CallbackQuery, state: FSMConte
     pay_date = datetime(pay_year, pay_month, 5).date()
 
     # Дней до зарплаты (только если ещё не наступила)
-    today = moscow_now().date()  # ← было datetime.now().date()
+    today = moscow_now().date()  # изменено
     if pay_date < today:
         days_until_pay = 0
     else:
@@ -1643,7 +1722,13 @@ async def process_stats_selection(callback: types.CallbackQuery, state: FSMConte
     )
 
     await state.set_state(UserStates.main_menu)
-    await callback.message.answer("📋 Главное меню:", reply_markup=get_main_menu_keyboard())
+
+    user_id = callback.from_user.id
+    is_director = await access_control.is_director(user_id)
+    await callback.message.answer(
+        "📋 Главное меню:",
+        reply_markup=get_main_menu_keyboard(is_director)
+    )
 
 
 @dp.callback_query(F.data == "ignore")
@@ -1672,6 +1757,7 @@ async def main():
         await bot_logger.log_action("SYSTEM", f"❌ Ошибка: {e}")
     finally:
         await bot.session.close()
+
 def _format_full_day_schedule(all_employees, schedule, highlight_employee=None):
     """
     Форматирует расписание на день: показывает только сотрудников с реальными сменами,
@@ -1761,7 +1847,7 @@ async def reminder_checker():
     """Фоновая задача: раз в минуту проверяет, кому отправить напоминания."""
     while True:
         try:
-            now = moscow_now()  # ← было datetime.now()
+            now = moscow_now()  # изменено
             current_time_str = now.strftime("%H:%M")
             current_hour = now.hour
             current_minute = now.minute
