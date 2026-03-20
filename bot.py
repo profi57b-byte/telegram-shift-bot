@@ -1531,6 +1531,9 @@ async def back_to_menu_button(message: types.Message, state: FSMContext):
 async def auto_start(message: types.Message, state: FSMContext):
     """Автоматический вход для пользователей из БД."""
     # Проверка доступа (middleware уже проверит, но для надёжности)
+    # Пропускаем команды — у них есть свои обработчики
+    if message.text and message.text.startswith('/'):
+        return
     has_access = await access_control.check_access(message.from_user.id)
     if not has_access:
         return  # middleware отправит сообщение о блокировке
