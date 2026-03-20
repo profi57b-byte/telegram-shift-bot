@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - LOG_CHAT_ID=${LOG_CHAT_ID}
+      - EXCEL_FILE=${EXCEL_FILE}
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
