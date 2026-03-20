@@ -124,3 +124,13 @@ class UserDatabase:
             ''') as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
+
+    async def get_all_users(self):
+        """Получить всех зарегистрированных пользователей с именами сотрудников."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                'SELECT * FROM users WHERE employee_name IS NOT NULL AND employee_name != ""'
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
