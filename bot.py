@@ -38,6 +38,14 @@ excel_parser = ExcelParser(EXCEL_FILE)
 db = UserDatabase()
 access_control = AccessControl()
 bot_logger = BotLogger(bot, LOG_CHAT_ID)
+# Словарь активных проверок часов: user_id сотрудника -> данные проверки
+pending_hour_checks: dict = {}
+
+MONTH_NAMES_RU = {
+    1: 'Январь', 2: 'Февраль', 3: 'Март', 4: 'Апрель',
+    5: 'Май', 6: 'Июнь', 7: 'Июль', 8: 'Август',
+    9: 'Сентябрь', 10: 'Октябрь', 11: 'Ноябрь', 12: 'Декабрь'
+}
 # Активные счётчики смен: user_id -> {message_id, chat_id, shift_start, shift_end}
 active_shift_counters = {}
 
@@ -62,6 +70,8 @@ class UserStates(StatesGroup):
     choosing_stats_month = State()
     choosing_daily_remind_time = State()
     director_choosing_employee = State()
+    entering_hours = State()           # ← НОВОЕ
+    confirming_entered_hours = State() # ← НОВОЕ
 
 
 # Функция поиска Excel файла
@@ -220,6 +230,7 @@ def get_main_menu_keyboard(is_director=False):
             [KeyboardButton(text="📅 Неделя"), KeyboardButton(text="📅 Дата")],
             [KeyboardButton(text="👥 Кто на смене?")],
             [KeyboardButton(text="📊 По сотрудникам"), KeyboardButton(text="📊 Отдел")],
+            [KeyboardButton(text="📋 Сверка часов")],  # ← НОВОЕ
             [KeyboardButton(text="ℹ️ О боте")]
         ]
     else:
@@ -1857,6 +1868,317 @@ async def shift_counter_updater():
             active_shift_counters.pop(user_id, None)
 
         await asyncio.sleep(5)
+
+# ============================================================
+# ФУНКЦИОНАЛ: СВЕРКА ЧАСОВ (для руководителей)
+# ============================================================
+
+@dp.message(StateFilter(UserStates.main_menu), F.text == "📋 Сверка часов")
+async def hours_check_broadcast(message: types.Message, state: FSMContext):
+    """Руководитель инициирует сверку часов со всеми сотрудниками."""
+    user_id = message.from_user.id
+    is_dir = await access_control.is_director(user_id) or access_control.is_admin(user_id)
+    if not is_dir:
+        await message.answer("⛔ Эта функция доступна только руководителям.")
+        return
+
+    now = moscow_now()
+    year, month = now.year, now.month
+    month_name = MONTH_NAMES_RU[month]
+
+    all_users = await db.get_all_users()
+    if not all_users:
+        await message.answer("⚠️ Нет зарегистрированных сотрудников.")
+        return
+
+    await message.answer("🔄 Начинаю рассылку запросов на сверку часов...")
+
+    sent_count = 0
+    skipped_count = 0
+
+    for user in all_users:
+        employee_user_id = user['user_id']
+        employee_name = user.get('employee_name')
+        if not employee_name:
+            skipped_count += 1
+            continue
+
+        # Считаем часы за текущий месяц
+        try:
+            stats = excel_parser.get_employee_stats_for_month(employee_name, year, month)
+            hours = stats['total_hours'] if stats else 0.0
+        except Exception as e:
+            logger.error(f"Ошибка получения часов для {employee_name}: {e}")
+            skipped_count += 1
+            continue
+
+        if hours < 1:
+            skipped_count += 1
+            continue
+
+        # Сохраняем данные для обработки ответа
+        pending_hour_checks[employee_user_id] = {
+            'director_id': user_id,
+            'hours': hours,
+            'month_name': month_name,
+            'month': month,
+            'year': year,
+            'employee_name': employee_name
+        }
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Да", callback_data="hr_yes"),
+            InlineKeyboardButton(text="✏️ Нет, изменить", callback_data="hr_no")
+        ]])
+
+        try:
+            await bot.send_message(
+                employee_user_id,
+                f"📋 <b>Сообщение от руководителя:</b>\n\n"
+                f"Привет! У тебя за <b>{month_name} {year}</b> — "
+                f"<b>{hours:.1f} ч</b>.\n\nДанные верны?",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+            sent_count += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение пользователю {employee_user_id}: {e}")
+            pending_hour_checks.pop(employee_user_id, None)
+            skipped_count += 1
+
+    await message.answer(
+        f"✅ <b>Рассылка завершена</b>\n\n"
+        f"📨 Отправлено: <b>{sent_count}</b>\n"
+        f"⏭ Пропущено (нет часов / не зарегистрированы): <b>{skipped_count}</b>",
+        parse_mode="HTML"
+    )
+    await bot_logger.log_action(
+        message.from_user.username or str(user_id),
+        f"🎯 Инициировал сверку часов за {month_name} {year} (отправлено: {sent_count})"
+    )
+
+
+@dp.callback_query(F.data == "hr_yes")
+async def hours_confirm_yes(callback: types.CallbackQuery, state: FSMContext):
+    """Сотрудник подтверждает часы из графика."""
+    user_id = callback.from_user.id
+    check = pending_hour_checks.get(user_id)
+
+    if not check:
+        await callback.answer("⚠️ Данные устарели или уже обработаны.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    director_id = check['director_id']
+    hours = check['hours']
+    month_name = check['month_name']
+    year = check['year']
+    employee_name = check['employee_name']
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    # Подтверждаем сотруднику
+    await callback.message.answer(
+        f"✅ <b>Данные подтверждены.</b>\n\n"
+        f"Ваши часы за <b>{month_name} {year}</b> — <b>{hours:.1f} ч</b> — переданы руководителю.",
+        parse_mode="HTML"
+    )
+
+    # Уведомляем руководителя
+    try:
+        await bot.send_message(
+            director_id,
+            f"✅ <b>{employee_name}</b> подтвердил(а) количество часов "
+            f"за <b>{month_name} {year}</b>: <b>{hours:.1f} ч</b>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Не удалось уведомить руководителя {director_id}: {e}")
+
+    pending_hour_checks.pop(user_id, None)
+    await callback.answer()
+    await bot_logger.log_action(
+        callback.from_user.username or str(user_id),
+        f"Подтвердил(а) часы за {month_name} {year}: {hours:.1f} ч"
+    )
+
+
+@dp.callback_query(F.data == "hr_no")
+async def hours_confirm_no(callback: types.CallbackQuery, state: FSMContext):
+    """Сотрудник хочет ввести другое количество часов."""
+    user_id = callback.from_user.id
+    check = pending_hour_checks.get(user_id)
+
+    if not check:
+        await callback.answer("⚠️ Данные устарели или уже обработаны.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    # Переносим данные в FSM state
+    await state.update_data(
+        hr_director_id=check['director_id'],
+        hr_hours_original=check['hours'],
+        hr_month_name=check['month_name'],
+        hr_month=check['month'],
+        hr_year=check['year'],
+        hr_employee_name=check['employee_name']
+    )
+    await state.set_state(UserStates.entering_hours)
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await callback.message.answer(
+        f"✏️ Введите количество часов за "
+        f"<b>{check['month_name']} {check['year']}</b>.\n\n"
+        f"Пример: <code>122</code> или <code>85.5</code>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.message(StateFilter(UserStates.entering_hours))
+async def process_entering_hours(message: types.Message, state: FSMContext):
+    """Обрабатывает ввод количества часов от сотрудника."""
+    user_data = await state.get_data()
+    month_name = user_data.get('hr_month_name', 'текущий месяц')
+    year = user_data.get('hr_year', '')
+
+    # Валидация
+    text = message.text.strip().replace(',', '.')
+    try:
+        hours = float(text)
+        if hours < 0:
+            raise ValueError("Отрицательное значение")
+        if hours > 744:
+            raise ValueError("Превышен максимум")
+    except ValueError:
+        await message.answer(
+            f"❌ <b>Некорректный ввод.</b>\n\n"
+            f"Пожалуйста, введите число часов (например: <code>122</code> или <code>85.5</code>).\n"
+            f"Допустимый диапазон: от 0 до 744.",
+            parse_mode="HTML"
+        )
+        return
+
+    hours = round(hours, 1)
+    await state.update_data(hr_hours_entered=hours)
+    await state.set_state(UserStates.confirming_entered_hours)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да", callback_data="hr_final_yes"),
+        InlineKeyboardButton(text="✏️ Нет, изменить", callback_data="hr_final_no")
+    ]])
+
+    await message.answer(
+        f"Вы указали <b>{hours:.1f} ч</b> за <b>{month_name} {year}</b>.\n\nДанные верны?",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+@dp.message(StateFilter(UserStates.confirming_entered_hours))
+async def hours_confirm_pending_text(message: types.Message, state: FSMContext):
+    """Перехватывает текст, пока ожидается нажатие кнопки подтверждения."""
+    user_data = await state.get_data()
+    month_name = user_data.get('hr_month_name', 'текущий месяц')
+    year = user_data.get('hr_year', '')
+    hours = user_data.get('hr_hours_entered', 0)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да", callback_data="hr_final_yes"),
+        InlineKeyboardButton(text="✏️ Нет, изменить", callback_data="hr_final_no")
+    ]])
+
+    await message.answer(
+        f"⬆️ Пожалуйста, используйте кнопки для подтверждения.\n\n"
+        f"Вы указали <b>{hours:.1f} ч</b> за <b>{month_name} {year}</b>.\n\nДанные верны?",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(F.data == "hr_final_yes")
+async def hours_final_confirm_yes(callback: types.CallbackQuery, state: FSMContext):
+    """Сотрудник подтверждает введённые вручную часы."""
+    user_id = callback.from_user.id
+    user_data = await state.get_data()
+
+    director_id = user_data.get('hr_director_id')
+    hours = user_data.get('hr_hours_entered')
+    month_name = user_data.get('hr_month_name', 'текущий месяц')
+    year = user_data.get('hr_year', '')
+    employee_name = user_data.get('hr_employee_name', f'user_{user_id}')
+
+    if not director_id or hours is None:
+        await callback.answer("⚠️ Произошла ошибка. Попробуйте снова через меню.", show_alert=True)
+        await state.set_state(UserStates.main_menu)
+        return
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    # Подтверждаем сотруднику
+    await callback.message.answer(
+        f"✅ <b>Данные успешно переданы руководителю!</b>\n\n"
+        f"Ваши часы за <b>{month_name} {year}</b>: <b>{hours:.1f} ч</b>",
+        parse_mode="HTML"
+    )
+
+    # Уведомляем руководителя
+    try:
+        await bot.send_message(
+            director_id,
+            f"✏️ <b>{employee_name}</b> указал(а) количество часов "
+            f"за <b>{month_name} {year}</b>: <b>{hours:.1f} ч</b>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Не удалось уведомить руководителя {director_id}: {e}")
+
+    pending_hour_checks.pop(user_id, None)
+    await state.set_state(UserStates.main_menu)
+    await callback.answer()
+    await bot_logger.log_action(
+        callback.from_user.username or str(user_id),
+        f"Указал(а) исправленные часы за {month_name} {year}: {hours:.1f} ч"
+    )
+
+
+@dp.callback_query(F.data == "hr_final_no")
+async def hours_final_confirm_no(callback: types.CallbackQuery, state: FSMContext):
+    """Сотрудник снова хочет изменить часы."""
+    user_data = await state.get_data()
+    month_name = user_data.get('hr_month_name', 'текущий месяц')
+    year = user_data.get('hr_year', '')
+
+    await state.set_state(UserStates.entering_hours)
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await callback.message.answer(
+        f"✏️ Введите количество часов за <b>{month_name} {year}</b>.\n\n"
+        f"Пример: <code>122</code> или <code>85.5</code>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
 
 async def main():
     """Запуск бота"""
