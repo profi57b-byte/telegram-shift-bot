@@ -38,6 +38,8 @@ excel_parser = ExcelParser(EXCEL_FILE)
 db = UserDatabase()
 access_control = AccessControl()
 bot_logger = BotLogger(bot, LOG_CHAT_ID)
+# Активные счётчики смен: user_id -> {message_id, chat_id, shift_start, shift_end}
+active_shift_counters = {}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1706,13 +1708,13 @@ async def process_stats_selection(callback: types.CallbackQuery, state: FSMConte
     response += f"✅ Уже отработано: <b>{stats['worked_hours']:.1f} ч</b>\n"
     response += f"📋 Осталось отработать: <b>{stats['remaining_hours']:.1f} ч</b>\n"
     response += f"📅 Рабочих дней: <b>{stats['worked_days']}</b>\n\n"
-    response += f"💰 Ожидаемая зарплата за месяц: <b>{stats['salary']:.0f} ₽</b>\n"
+    response += f"💰 Ожидаемая ЗП за месяц: <b>{stats['salary']:.0f} ₽</b>\n"
     response += f"💵 Уже заработано: <b>{stats['earned_salary']:.0f} ₽</b>\n\n"
     response += f"📅 Дата выплаты: <b>{pay_date.strftime('%d.%m.%Y')}</b>\n"
     if days_until_pay > 0:
-        response += f"⏳ Дней до зарплаты: <b>{days_until_pay}</b>"
+        response += f"⏳ Дней до ЗП: <b>{days_until_pay}</b>"
     else:
-        response += f"✅ Зарплата уже выплачена"
+        response += f"✅ ЗП уже выплачена"
 
     await callback.message.edit_text(response, parse_mode="HTML")
 
@@ -1730,12 +1732,128 @@ async def process_stats_selection(callback: types.CallbackQuery, state: FSMConte
         reply_markup=get_main_menu_keyboard(is_director)
     )
 
+@dp.message(Command("smena"))
+async def cmd_test_smena(message: types.Message):
+    """Тестовая команда: симулирует начало смены на 4 часа"""
+    if not access_control.is_admin(message.from_user.id):
+        await message.answer("⛔ Только для администратора.")
+        return
+
+    now = moscow_now()
+    shift_start = now.replace(second=0, microsecond=0)
+    shift_end   = shift_start + timedelta(minutes=5)
+
+    msg = await message.answer(
+        f"⏱ <b>Смена началась!</b>\n\n"
+        f"💰 <b>0.00 руб.</b> уже заработано за смену.\n"
+        f"⏳ Осталось работать: считаю...",
+        parse_mode="HTML"
+    )
+    active_shift_counters[message.from_user.id] = {
+        'message_id':  msg.message_id,
+        'chat_id':     msg.chat.id,
+        'shift_start': shift_start,
+        'shift_end':   shift_end
+    }
+    await message.answer(
+        f"✅ Тестовая смена запущена.\n"
+        f"Начало: {shift_start.strftime('%H:%M')}, конец: {shift_end.strftime('%H:%M')}"
+    )
+
+
+@dp.message(Command("nesmena"))
+async def cmd_test_nesmena(message: types.Message):
+    """Тестовая команда: останавливает счётчик и показывает финальное сообщение"""
+    if not access_control.is_admin(message.from_user.id):
+        await message.answer("⛔ Только для администратора.")
+        return
+
+    user_id = message.from_user.id
+    if user_id not in active_shift_counters:
+        await message.answer("⚠️ Активной тестовой смены нет. Сначала запусти /smena.")
+        return
+
+    data = active_shift_counters.pop(user_id)
+    shift_start   = data['shift_start']
+    now           = moscow_now()
+    elapsed_min   = (now - shift_start).total_seconds() / 60
+    total_earned  = elapsed_min * (160 / 60)
+
+    try:
+        await bot.edit_message_text(
+            chat_id=data['chat_id'],
+            message_id=data['message_id'],
+            text=(
+                f"✅ <b>{total_earned:.2f} руб. заработано за смену.</b>\n\n"
+                f"Владислав гордится тобой!"
+            ),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отредактировать сообщение: {e}")
+        return
+
+    await message.answer("✅ Тестовая смена остановлена.")
 
 @dp.callback_query(F.data == "ignore")
 async def ignore_callback(callback: types.CallbackQuery):
     """Игнорируем пустые кнопки календаря"""
     await callback.answer()
 
+async def shift_counter_updater():
+    """Каждые 5 секунд обновляет сообщение со счётчиком заработка."""
+    while True:
+        now = moscow_now()
+        to_remove = []
+
+        for user_id, data in list(active_shift_counters.items()):
+            shift_start = data['shift_start']
+            shift_end   = data['shift_end']
+            message_id  = data['message_id']
+            chat_id     = data['chat_id']
+
+            try:
+                if now >= shift_end:
+                    # Смена закончилась — финальное сообщение
+                    total_minutes = (shift_end - shift_start).total_seconds() / 60
+                    total_earned  = total_minutes * (160 / 60)
+                    final_text = (
+                        f"✅ <b>{total_earned:.2f} руб. заработано за смену.</b>\n\n"
+                        f"Владислав гордится тобой!"
+                    )
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=final_text,
+                        parse_mode="HTML"
+                    )
+                    to_remove.append(user_id)
+                else:
+                    # Смена идёт — обновляем счётчик
+                    elapsed_minutes = (now - shift_start).total_seconds() / 60
+                    earned          = elapsed_minutes * (160 / 60)
+                    remaining_secs  = int((shift_end - now).total_seconds())
+                    rem_hours       = remaining_secs // 3600
+                    rem_minutes     = (remaining_secs % 3600) // 60
+
+                    text = (
+                        f"⏱ <b>Смена идёт!</b>\n\n"
+                        f"💰 <b>{earned:.2f} руб.</b> уже заработано за смену.\n"
+                        f"⏳ Осталось работать: <b>{rem_hours} ч. {rem_minutes:02d} мин.</b>"
+                    )
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        parse_mode="HTML"
+                    )
+            except Exception as e:
+                logger.debug(f"shift_counter_updater: {e}")
+
+        for user_id in to_remove:
+            active_shift_counters.pop(user_id, None)
+
+        await asyncio.sleep(5)
 
 async def main():
     """Запуск бота"""
@@ -1745,6 +1863,7 @@ async def main():
 
     # Запускаем фоновую задачу
     asyncio.create_task(reminder_checker())
+    asyncio.create_task(shift_counter_updater())
 
     logger.info("Бот запущен")
     admin_info = access_control.get_admin_info()
@@ -1890,6 +2009,39 @@ async def reminder_checker():
                                     break
                             except:
                                 continue
+
+                # Запуск счётчика при начале смены
+                shifts_today = excel_parser.get_employee_schedule(employee_name, now)
+                if shifts_today and user_id not in active_shift_counters:
+                    for shift in shifts_today:
+                        try:
+                            start_str, end_str = shift['time'].split('-')
+                            s_h, s_m = map(int, start_str.split(':'))
+                            e_h, e_m = map(int, end_str.split(':'))
+
+                            if now.hour == s_h and now.minute == s_m:
+                                shift_start = now.replace(second=0, microsecond=0)
+                                shift_end = shift_start.replace(hour=e_h % 24, minute=e_m)
+                                if e_h >= 24 or e_h < s_h:
+                                    shift_end += timedelta(days=1)
+                                    shift_end = shift_end.replace(hour=e_h % 24, minute=e_m)
+
+                                msg = await bot.send_message(
+                                    user_id,
+                                    f"⏱ <b>Смена началась!</b>\n\n"
+                                    f"💰 <b>0.00 руб.</b> уже заработано за смену.\n"
+                                    f"⏳ Осталось работать: считаю...",
+                                    parse_mode="HTML"
+                                )
+                                active_shift_counters[user_id] = {
+                                    'message_id': msg.message_id,
+                                    'chat_id': msg.chat.id,
+                                    'shift_start': shift_start,
+                                    'shift_end': shift_end
+                                }
+                                break
+                        except Exception as e:
+                            logger.debug(f"Ошибка запуска счётчика смены: {e}")
 
                 # Ежедневное напоминание (о завтрашней смене)
                 if daily_time and current_time_str == daily_time:
