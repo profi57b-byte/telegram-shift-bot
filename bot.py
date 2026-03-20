@@ -1428,6 +1428,71 @@ async def process_name_selection(message: types.Message, state: FSMContext):
             reply_markup=get_name_keyboard(employees)
         )
 
+@dp.message(Command("smena"))
+async def cmd_test_smena(message: types.Message):
+    """Тестовая команда: симулирует начало смены на 4 часа"""
+    if not access_control.is_admin(message.from_user.id):
+        await message.answer("⛔ Только для администратора.")
+        return
+
+    now = moscow_now()
+    shift_start = now.replace(second=0, microsecond=0)
+    shift_end   = shift_start + timedelta(hours=4)
+
+    msg = await message.answer(
+        f"⏱ <b>Смена началась!</b>\n\n"
+        f"💰 <b>0.00 руб.</b> уже заработано за смену.\n"
+        f"⏳ Осталось работать: считаю...",
+        parse_mode="HTML"
+    )
+    active_shift_counters[message.from_user.id] = {
+        'message_id':  msg.message_id,
+        'chat_id':     msg.chat.id,
+        'shift_start': shift_start,
+        'shift_end':   shift_end
+    }
+    await bot.pin_chat_message(chat_id=msg.chat.id, message_id=msg.message_id, disable_notification=True)
+
+    await message.answer(
+        f"✅ Тестовая смена запущена.\n"
+        f"Начало: {shift_start.strftime('%H:%M')}, конец: {shift_end.strftime('%H:%M')}"
+    )
+
+
+@dp.message(Command("nesmena"))
+async def cmd_test_nesmena(message: types.Message):
+    """Тестовая команда: останавливает счётчик и показывает финальное сообщение"""
+    if not access_control.is_admin(message.from_user.id):
+        await message.answer("⛔ Только для администратора.")
+        return
+
+    user_id = message.from_user.id
+    if user_id not in active_shift_counters:
+        await message.answer("⚠️ Активной тестовой смены нет. Сначала запусти /smena.")
+        return
+
+    data = active_shift_counters.pop(user_id)
+    shift_start   = data['shift_start']
+    now           = moscow_now()
+    elapsed_min   = (now - shift_start).total_seconds() / 60
+    total_earned  = elapsed_min * (160 / 60)
+
+    try:
+        await bot.edit_message_text(
+            chat_id=data['chat_id'],
+            message_id=data['message_id'],
+            text=(
+                f"✅ <b>{total_earned:.2f} руб. заработано за смену.</b>\n\n"
+                f"Владислав гордится тобой!"
+            ),
+            parse_mode="HTML"
+        )
+        await bot.unpin_chat_message(chat_id=data['chat_id'], message_id=data['message_id'])
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отредактировать сообщение: {e}")
+        return
+
+    await message.answer("✅ Тестовая смена остановлена.")
 
 # Обработчики главного меню (кнопки)
 @dp.message(StateFilter(UserStates.main_menu), F.text == "📅 Сегодня")
@@ -1526,69 +1591,6 @@ async def back_to_menu_button(message: types.Message, state: FSMContext):
         "📋 Главное меню:",
         reply_markup=get_main_menu_keyboard(is_director)
     )
-
-@dp.message(Command("smena"))
-async def cmd_test_smena(message: types.Message):
-    """Тестовая команда: симулирует начало смены на 4 часа"""
-    if not access_control.is_admin(message.from_user.id):
-        await message.answer("⛔ Только для администратора.")
-        return
-
-    now = moscow_now()
-    shift_start = now.replace(second=0, microsecond=0)
-    shift_end   = shift_start + timedelta(minutes=5)
-
-    msg = await message.answer(
-        f"⏱ <b>Смена началась!</b>\n\n"
-        f"💰 <b>0.00 руб.</b> уже заработано за смену.\n"
-        f"⏳ Осталось работать: считаю...",
-        parse_mode="HTML"
-    )
-    active_shift_counters[message.from_user.id] = {
-        'message_id':  msg.message_id,
-        'chat_id':     msg.chat.id,
-        'shift_start': shift_start,
-        'shift_end':   shift_end
-    }
-    await message.answer(
-        f"✅ Тестовая смена запущена.\n"
-        f"Начало: {shift_start.strftime('%H:%M')}, конец: {shift_end.strftime('%H:%M')}"
-    )
-
-
-@dp.message(Command("nesmena"))
-async def cmd_test_nesmena(message: types.Message):
-    """Тестовая команда: останавливает счётчик и показывает финальное сообщение"""
-    if not access_control.is_admin(message.from_user.id):
-        await message.answer("⛔ Только для администратора.")
-        return
-
-    user_id = message.from_user.id
-    if user_id not in active_shift_counters:
-        await message.answer("⚠️ Активной тестовой смены нет. Сначала запусти /smena.")
-        return
-
-    data = active_shift_counters.pop(user_id)
-    shift_start   = data['shift_start']
-    now           = moscow_now()
-    elapsed_min   = (now - shift_start).total_seconds() / 60
-    total_earned  = elapsed_min * (160 / 60)
-
-    try:
-        await bot.edit_message_text(
-            chat_id=data['chat_id'],
-            message_id=data['message_id'],
-            text=(
-                f"✅ <b>{total_earned:.2f} руб. заработано за смену.</b>\n\n"
-                f"Владислав гордится тобой!"
-            ),
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        await message.answer(f"❌ Не удалось отредактировать сообщение: {e}")
-        return
-
-    await message.answer("✅ Тестовая смена остановлена.")
 
 @dp.message(F.text)
 async def auto_start(message: types.Message, state: FSMContext):
@@ -1827,6 +1829,7 @@ async def shift_counter_updater():
                         text=final_text,
                         parse_mode="HTML"
                     )
+                    await bot.unpin_chat_message(chat_id=chat_id, message_id=message_id)
                     to_remove.append(user_id)
                 else:
                     # Смена идёт — обновляем счётчик
@@ -2039,6 +2042,8 @@ async def reminder_checker():
                                     'shift_start': shift_start,
                                     'shift_end': shift_end
                                 }
+                                await bot.pin_chat_message(chat_id=msg.chat.id, message_id=msg.message_id,
+                                                           disable_notification=True)
                                 break
                         except Exception as e:
                             logger.debug(f"Ошибка запуска счётчика смены: {e}")
