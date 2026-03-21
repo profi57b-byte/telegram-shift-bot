@@ -1,7 +1,3 @@
-"""
-Telegram бот для управления графиком смен L1.5
-Версия 2.0 - финальная
-"""
 import os
 import logging
 from datetime import datetime, timedelta, time
@@ -40,6 +36,8 @@ access_control = AccessControl()
 bot_logger = BotLogger(bot, LOG_CHAT_ID)
 # Словарь активных проверок часов: user_id сотрудника -> данные проверки
 pending_hour_checks: dict = {}
+# Сессия сверки часов: director_id -> {всего сотрудников, подтверждённые данные}
+hours_check_sessions: dict = {}
 
 MONTH_NAMES_RU = {
     1: 'Январь', 2: 'Февраль', 3: 'Март', 4: 'Апрель',
@@ -228,13 +226,11 @@ def get_main_menu_keyboard(is_director=False):
         keyboard = [
             [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📅 Завтра")],
             [KeyboardButton(text="📅 Неделя"), KeyboardButton(text="📅 Дата")],
-            [KeyboardButton(text="👥 Кто на смене?")],
+            [KeyboardButton(text="👥 Кто на смене?"), KeyboardButton(text="📋 Сверка часов")],
             [KeyboardButton(text="📊 По сотрудникам"), KeyboardButton(text="📊 Отдел")],
-            [KeyboardButton(text="📋 Сверка часов")],  # ← НОВОЕ
             [KeyboardButton(text="ℹ️ О боте")]
         ]
     else:
-        # полное меню для сотрудников
         keyboard = [
             [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📅 Завтра")],
             [KeyboardButton(text="📅 Неделя"), KeyboardButton(text="📅 Дата")],
@@ -443,13 +439,13 @@ async def process_department_stats(callback: types.CallbackQuery, state: FSMCont
         9: 'Сентябрь', 10: 'Октябрь', 11: 'Ноябрь', 12: 'Декабрь'
     }
     response = f"📊 <b>Статистика отдела за {month_names[month]} {year}</b>\n\n"
-    response += f"Всего часов в месяце: <b>{total:.1f}</b>\n\n"
+    response += f"Всего часов в месяце: <b>{total:.0f}</b>\n\n"
 
     # Сотрудники (только те, у кого >0)
     if employee_hours:
         response += "<b>Часы по сотрудникам:</b>\n"
         for name, hours in sorted(employee_hours.items()):
-            response += f"• {name}: {hours:.1f} ч\n"
+            response += f"• {name}: {hours:.0f} ч\n"
     else:
         response += "Нет данных по сотрудникам.\n"
 
@@ -602,9 +598,9 @@ async def director_stats_show(callback: types.CallbackQuery, state: FSMContext):
 
     response = f"📊 <b>Статистика за {month_names[month]} {year}</b>\n\n"
     response += f"👤 <b>{employee_name}</b>\n\n"
-    response += f"⏰ Всего часов в месяце: <b>{stats['total_hours']:.1f} ч</b>\n"
-    response += f"✅ Уже отработано: <b>{stats['worked_hours']:.1f} ч</b>\n"
-    response += f"📋 Осталось отработать: <b>{stats['remaining_hours']:.1f} ч</b>\n"
+    response += f"⏰ Всего часов в месяце: <b>{stats['total_hours']:.0f} ч</b>\n"
+    response += f"✅ Уже отработано: <b>{stats['worked_hours']:.0f} ч</b>\n"
+    response += f"📋 Осталось отработать: <b>{stats['remaining_hours']:.0f} ч</b>\n"
     response += f"📅 Рабочих дней: <b>{stats['worked_days']}</b>\n\n"
     response += f"💰 Ожидаемая зарплата за месяц: <b>{stats['salary']:.0f} ₽</b>\n"
     response += f"💵 Уже заработано: <b>{stats['earned_salary']:.0f} ₽</b>\n\n"
@@ -1559,10 +1555,13 @@ async def show_about(message: types.Message):
     """Показать информацию о боте"""
     about_text = (
         "🤖 <b>Бот управления графиком L1.5</b>\n\n"
-        "📊 Версия: 1.8\n\n"
+        "📊 Версия: 2.2.1 (21.03.2026)\n\n"
         "🔹 <b>Возможности:</b>\n"
         "• Просмотр расписания смен\n"
+        "• «Рублемер»\n"
         "• Информация о текущем дежурном\n"
+        "• Сверка часов в конце месяца\n"
+        "• Уведомления о предстоящих сменах\n"
         "• Статистика работы\n\n"
         "💡 По вопросам обращайтесь к @photon_27."
     )
@@ -1603,40 +1602,242 @@ async def back_to_menu_button(message: types.Message, state: FSMContext):
         reply_markup=get_main_menu_keyboard(is_director)
     )
 
-@dp.message(F.text)
-async def auto_start(message: types.Message, state: FSMContext):
-    """Автоматический вход для пользователей из БД."""
-    # Проверка доступа (middleware уже проверит, но для надёжности)
-    has_access = await access_control.check_access(message.from_user.id)
-    if not has_access:
-        return  # middleware отправит сообщение о блокировке
-
-    user_data_db = await db.get_user(message.from_user.id)
-    if not user_data_db:
-        # Пользователь не в БД – предлагаем /start
-        await message.answer("👋 Для начала работы используйте /start")
+async def _record_hours_and_check_complete(director_id: int, employee_name: str, hours: int):
+    """Записывает подтверждённые часы и проверяет, все ли ответили."""
+    session = hours_check_sessions.get(director_id)
+    if not session:
+        logger.warning(f"_record_hours_and_check_complete: сессия для директора {director_id} не найдена")
         return
 
-    # Есть в БД – восстанавливаем
-    await state.update_data(employee_name=user_data_db['employee_name'])
-    await state.set_state(UserStates.main_menu)
+    session['confirmed'][employee_name] = hours
+
+    confirmed_count = len(session['confirmed'])
+    total_count = session['total']
+
+    logger.info(f"Сверка часов: подтверждено {confirmed_count}/{total_count} (директор {director_id})")
+
+    if confirmed_count < total_count:
+        return  # ещё не все ответили
+
+    # Все ответили — формируем итоговое сообщение
+    import calendar
+    month_name = session['month_name']
+    month = session['month']
+    year = session['year']
+
+    days_in_month = calendar.monthrange(year, month)[1]
+    expected_total = days_in_month * 14
+    actual_total = sum(session['confirmed'].values())
+
+    sorted_employees = sorted(session['confirmed'].items(), key=lambda x: x[1], reverse=True)
+
+    lines = []
+    for emp, h in sorted_employees:
+        lines.append(f"  • {emp} — <b>{h} ч</b>")
+    employees_block = "\n".join(lines)
+
+    if actual_total == expected_total:
+        check_line = f"✅ Сумма сходится: <b>{actual_total} ч</b> = {days_in_month} дн × 14 ч"
+    else:
+        diff = actual_total - expected_total
+        sign = "+" if diff > 0 else ""
+        check_line = (
+            f"⚠️ Сумма <b>не сходится</b>!\n"
+            f"  Фактически: <b>{actual_total} ч</b>\n"
+            f"  Ожидалось: <b>{expected_total} ч</b> ({days_in_month} дн × 14 ч)\n"
+            f"  Расхождение: <b>{sign}{diff} ч</b>"
+        )
+
+    summary = (
+        f"📋 <b>Сверка часов за {month_name} {year} завершена</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{employees_block}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Итого: <b>{actual_total} ч</b> / {confirmed_count} сотрудников\n\n"
+        f"{check_line}"
+    )
+
+    try:
+        await bot.send_message(director_id, summary, parse_mode="HTML")
+        logger.info(f"Сводка сверки отправлена директору {director_id}")
+    except Exception as e:
+        logger.error(f"Ошибка отправки итогов сверки руководителю {director_id}: {e}")
+
+    hours_check_sessions.pop(director_id, None)
+
+# ============================================================
+# ФУНКЦИОНАЛ: СВЕРКА ЧАСОВ (для руководителей)
+# ============================================================
+
+@dp.message(StateFilter(UserStates.main_menu), F.text == "📋 Сверка часов")
+async def hours_check_broadcast(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    is_director = await access_control.is_director(user_id)
+    is_dir = await access_control.is_director(user_id) or access_control.is_admin(user_id)
+    if not is_dir:
+        await message.answer("⛔ Эта функция доступна только руководителям.")
+        return
+
+    now = moscow_now()
+    year, month = now.year, now.month
+    month_name = MONTH_NAMES_RU[month]
+
+    all_users = await db.get_all_users()
+    if not all_users:
+        await message.answer("⚠️ Нет зарегистрированных сотрудников.")
+        return
+
+    await message.answer("🔄 Начинаю рассылку запросов на сверку часов...")
+
+    # Сбрасываем сессию для этого руководителя
+    hours_check_sessions[user_id] = {
+        'total': 0,  # сколько всего сотрудников ждём
+        'confirmed': {},  # employee_name -> hours
+        'month_name': month_name,
+        'month': month,
+        'year': year
+    }
+
+    sent_count = 0
+    skipped_count = 0
+
+    for user in all_users:
+        employee_user_id = user['user_id']
+        employee_name = user.get('employee_name')
+        if not employee_name:
+            skipped_count += 1
+            continue
+
+        # Пропускаем самого руководителя — он не должен сам себе подтверждать часы
+        if employee_user_id == user_id:
+            skipped_count += 1
+            continue
+
+        try:
+            stats = excel_parser.get_employee_stats_for_month(employee_name, year, month)
+            hours = int(stats['total_hours']) if stats else 0
+        except Exception as e:
+            logger.error(f"Ошибка получения часов для {employee_name}: {e}")
+            skipped_count += 1
+            continue
+
+        if hours < 1:
+            skipped_count += 1
+            continue
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Да", callback_data="hr_yes"),
+            InlineKeyboardButton(text="✏️ Нет, изменить", callback_data="hr_no")
+        ]])
+
+        try:
+            sent_msg = await bot.send_message(
+                employee_user_id,
+                f"📋 <b>Сообщение от руководителя:</b>\n\n"
+                f"Привет! У тебя за <b>{month_name} {year}</b> — "
+                f"<b>{hours} ч</b>.\n\nДанные верны?",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+            pending_hour_checks[employee_user_id] = {
+                'director_id': user_id,
+                'hours': hours,
+                'month_name': month_name,
+                'month': month,
+                'year': year,
+                'employee_name': employee_name,
+                'sent_at': moscow_now(),
+                'message_id': sent_msg.message_id
+            }
+            sent_count += 1
+            hours_check_sessions[user_id]['total'] += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение пользователю {employee_user_id}: {e}")
+            skipped_count += 1
+
+        # Если никому не отправили — сразу сообщаем директору
+    if sent_count == 0:
+        hours_check_sessions.pop(user_id, None)
+        await message.answer(
+            f"⚠️ Нет сотрудников с часами за <b>{month_name} {year}</b> для сверки.",
+            parse_mode="HTML"
+        )
+        return
+
     await message.answer(
-        f"👋 С возвращением, {user_data_db['employee_name']}!\n\n"
-        f"Повторите ваш запрос, пожалуйста.\n"
-        f"Можете изменить настройки через меню ⚙️",
-        reply_markup=get_main_menu_keyboard(is_director)
+        f"✅ <b>Рассылка завершена</b>\n\n"
+        f"📨 Отправлено: <b>{sent_count}</b>\n"
+        f"⏭ Пропущено: <b>{skipped_count}</b>",
+        parse_mode="HTML"
+    )
+    await bot_logger.log_action(
+        message.from_user.username or str(user_id),
+        f"🎯 Инициировал сверку часов за {month_name} {year} (отправлено: {sent_count})"
     )
 
-@dp.message(StateFilter(UserStates.main_menu))
-async def handle_unknown_message(message: types.Message):
-    """Обработка неизвестных команд"""
-    await message.answer(
-        "❓ Не знаю такой команды.\n\n"
-        "Используйте кнопки меню или команду /help для просмотра доступных команд."
-    )
 
+@dp.message(StateFilter(None), F.text)
+async def auto_start(message: types.Message, state: FSMContext):
+    """Автоматический вход для пользователей из БД после перезапуска."""
+    has_access = await access_control.check_access(message.from_user.id)
+    if not has_access:
+        return
+
+    is_director = await access_control.is_director(message.from_user.id)
+    if is_director:
+        await state.update_data(is_director=True)
+        await state.set_state(UserStates.main_menu)
+        if message.text == "📋 Сверка часов":
+            await hours_check_broadcast(message, state)
+        elif message.text == "📊 По сотрудникам":
+            await director_stats_choose_employee(message, state)
+        elif message.text == "📊 Отдел":
+            await department_stats_start(message, state)
+        elif message.text == "👥 Кто на смене?":
+            await show_current_shift(message, state)
+        elif message.text == "📅 Сегодня":
+            await cmd_today(message, state)
+        elif message.text == "📅 Завтра":
+            await cmd_tomorrow(message, state)
+        elif message.text == "📅 Неделя":
+            await cmd_week(message, state)
+        else:
+            await message.answer(
+                "📋 Главное меню:",
+                reply_markup=get_main_menu_keyboard(is_director=True)
+            )
+        return
+
+    user_data_db = await db.get_user(message.from_user.id)
+    if not user_data_db or not user_data_db.get('employee_name'):
+        await message.answer(
+            "👋 Для начала работы используйте /start"
+        )
+        return
+
+    # Восстанавливаем состояние из БД
+    employee_name = user_data_db['employee_name']
+    await state.update_data(employee_name=employee_name)
+    await state.set_state(UserStates.main_menu)
+
+    # Сразу выполняем команду — не просим повторить
+    if message.text == "📅 Сегодня":
+        await cmd_today(message, state)
+    elif message.text == "📅 Завтра":
+        await cmd_tomorrow(message, state)
+    elif message.text == "📅 Неделя":
+        await cmd_week(message, state)
+    elif message.text == "👥 Кто на смене?":
+        await show_current_shift(message, state)
+    elif message.text == "📊 Статистика":
+        await cmd_stats(message, state)
+    elif message.text == "⚙️ Настройки":
+        await cmd_settings(message, state)
+    else:
+        await message.answer(
+            f"👋 С возвращением, {employee_name}!",
+            reply_markup=get_main_menu_keyboard(False)
+        )
 
 # Callback обработчики
 @dp.callback_query(F.data.startswith("cal_nav:"))
@@ -1780,9 +1981,9 @@ async def process_stats_selection(callback: types.CallbackQuery, state: FSMConte
     # Формирование ответа
     response = f"📊 <b>Статистика за {month_names[month]} {year}</b>\n\n"
     response += f"👤 <b>{employee_name}</b>\n\n"
-    response += f"⏰ Всего часов в месяце: <b>{stats['total_hours']:.1f} ч</b>\n"
-    response += f"✅ Уже отработано: <b>{stats['worked_hours']:.1f} ч</b>\n"
-    response += f"📋 Осталось отработать: <b>{stats['remaining_hours']:.1f} ч</b>\n"
+    response += f"⏰ Всего часов в месяце: <b>{stats['total_hours']:.0f} ч</b>\n"
+    response += f"✅ Уже отработано: <b>{stats['worked_hours']:.0f} ч</b>\n"
+    response += f"📋 Осталось отработать: <b>{stats['remaining_hours']:.0f} ч</b>\n"
     response += f"📅 Рабочих дней: <b>{stats['worked_days']}</b>\n\n"
     response += f"💰 Ожидаемая ЗП за месяц: <b>{stats['salary']:.0f} ₽</b>\n"
     response += f"💵 Уже заработано: <b>{stats['earned_salary']:.0f} ₽</b>\n\n"
@@ -1842,6 +2043,14 @@ async def shift_counter_updater():
                     )
                     await bot.unpin_chat_message(chat_id=chat_id, message_id=message_id)
                     to_remove.append(user_id)
+
+                    # Логируем завершение
+                    await bot_logger.log_action(
+                        f"user_{user_id}",
+                        f"✅ Рублемер завершён. Итого: {total_earned:.2f} руб. "
+                        f"Смена: {shift_start.strftime('%H:%M')}–{shift_end.strftime('%H:%M')}. "
+                        f"Сообщение откреплено (ID: {message_id})"
+                    )
                 else:
                     # Смена идёт — обновляем счётчик
                     elapsed_minutes = (now - shift_start).total_seconds() / 60
@@ -1861,6 +2070,15 @@ async def shift_counter_updater():
                         text=text,
                         parse_mode="HTML"
                     )
+
+                    # Логируем каждые 30 минут (чтобы не спамить)
+                    if int(elapsed_minutes) % 30 == 0 and int(elapsed_minutes) > 0:
+                        await bot_logger.log_action(
+                            f"user_{user_id}",
+                            f"⏱ Рублемер: {earned:.2f} руб., осталось {rem_hours} ч. {rem_minutes:02d} мин. "
+                            f"(сообщение ID: {message_id})"
+                        )
+
             except Exception as e:
                 logger.debug(f"shift_counter_updater: {e}")
 
@@ -1869,99 +2087,8 @@ async def shift_counter_updater():
 
         await asyncio.sleep(5)
 
-# ============================================================
-# ФУНКЦИОНАЛ: СВЕРКА ЧАСОВ (для руководителей)
-# ============================================================
-
-@dp.message(StateFilter(UserStates.main_menu), F.text == "📋 Сверка часов")
-async def hours_check_broadcast(message: types.Message, state: FSMContext):
-    """Руководитель инициирует сверку часов со всеми сотрудниками."""
-    user_id = message.from_user.id
-    is_dir = await access_control.is_director(user_id) or access_control.is_admin(user_id)
-    if not is_dir:
-        await message.answer("⛔ Эта функция доступна только руководителям.")
-        return
-
-    now = moscow_now()
-    year, month = now.year, now.month
-    month_name = MONTH_NAMES_RU[month]
-
-    all_users = await db.get_all_users()
-    if not all_users:
-        await message.answer("⚠️ Нет зарегистрированных сотрудников.")
-        return
-
-    await message.answer("🔄 Начинаю рассылку запросов на сверку часов...")
-
-    sent_count = 0
-    skipped_count = 0
-
-    for user in all_users:
-        employee_user_id = user['user_id']
-        employee_name = user.get('employee_name')
-        if not employee_name:
-            skipped_count += 1
-            continue
-
-        # Считаем часы за текущий месяц
-        try:
-            stats = excel_parser.get_employee_stats_for_month(employee_name, year, month)
-            hours = stats['total_hours'] if stats else 0.0
-        except Exception as e:
-            logger.error(f"Ошибка получения часов для {employee_name}: {e}")
-            skipped_count += 1
-            continue
-
-        if hours < 1:
-            skipped_count += 1
-            continue
-
-        # Сохраняем данные для обработки ответа
-        pending_hour_checks[employee_user_id] = {
-            'director_id': user_id,
-            'hours': hours,
-            'month_name': month_name,
-            'month': month,
-            'year': year,
-            'employee_name': employee_name
-        }
-
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Да", callback_data="hr_yes"),
-            InlineKeyboardButton(text="✏️ Нет, изменить", callback_data="hr_no")
-        ]])
-
-        try:
-            await bot.send_message(
-                employee_user_id,
-                f"📋 <b>Сообщение от руководителя:</b>\n\n"
-                f"Привет! У тебя за <b>{month_name} {year}</b> — "
-                f"<b>{hours:.1f} ч</b>.\n\nДанные верны?",
-                parse_mode="HTML",
-                reply_markup=keyboard
-            )
-            sent_count += 1
-            await asyncio.sleep(0.05)
-        except Exception as e:
-            logger.error(f"Не удалось отправить сообщение пользователю {employee_user_id}: {e}")
-            pending_hour_checks.pop(employee_user_id, None)
-            skipped_count += 1
-
-    await message.answer(
-        f"✅ <b>Рассылка завершена</b>\n\n"
-        f"📨 Отправлено: <b>{sent_count}</b>\n"
-        f"⏭ Пропущено (нет часов / не зарегистрированы): <b>{skipped_count}</b>",
-        parse_mode="HTML"
-    )
-    await bot_logger.log_action(
-        message.from_user.username or str(user_id),
-        f"🎯 Инициировал сверку часов за {month_name} {year} (отправлено: {sent_count})"
-    )
-
-
 @dp.callback_query(F.data == "hr_yes")
 async def hours_confirm_yes(callback: types.CallbackQuery, state: FSMContext):
-    """Сотрудник подтверждает часы из графика."""
     user_id = callback.from_user.id
     check = pending_hour_checks.get(user_id)
 
@@ -1984,30 +2111,20 @@ async def hours_confirm_yes(callback: types.CallbackQuery, state: FSMContext):
     except Exception:
         pass
 
-    # Подтверждаем сотруднику
     await callback.message.answer(
         f"✅ <b>Данные подтверждены.</b>\n\n"
-        f"Ваши часы за <b>{month_name} {year}</b> — <b>{hours:.1f} ч</b> — переданы руководителю.",
+        f"Ваши часы за <b>{month_name} {year}</b> — <b>{hours} ч</b> — переданы руководителю.",
         parse_mode="HTML"
     )
-
-    # Уведомляем руководителя
-    try:
-        await bot.send_message(
-            director_id,
-            f"✅ <b>{employee_name}</b> подтвердил(а) количество часов "
-            f"за <b>{month_name} {year}</b>: <b>{hours:.1f} ч</b>",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"Не удалось уведомить руководителя {director_id}: {e}")
 
     pending_hour_checks.pop(user_id, None)
     await callback.answer()
     await bot_logger.log_action(
         callback.from_user.username or str(user_id),
-        f"Подтвердил(а) часы за {month_name} {year}: {hours:.1f} ч"
+        f"Подтвердил(а) часы за {month_name} {year}: {hours} ч"
     )
+
+    await _record_hours_and_check_complete(director_id, employee_name, hours)
 
 
 @dp.callback_query(F.data == "hr_no")
@@ -2043,7 +2160,7 @@ async def hours_confirm_no(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer(
         f"✏️ Введите количество часов за "
         f"<b>{check['month_name']} {check['year']}</b>.\n\n"
-        f"Пример: <code>122</code> или <code>85.5</code>",
+        f"Пример: <code>122</code> или <code>137</code> (целое число)",
         parse_mode="HTML"
     )
     await callback.answer()
@@ -2056,24 +2173,26 @@ async def process_entering_hours(message: types.Message, state: FSMContext):
     month_name = user_data.get('hr_month_name', 'текущий месяц')
     year = user_data.get('hr_year', '')
 
-    # Валидация
-    text = message.text.strip().replace(',', '.')
-    try:
-        hours = float(text)
-        if hours < 0:
-            raise ValueError("Отрицательное значение")
-        if hours > 744:
-            raise ValueError("Превышен максимум")
-    except ValueError:
+    text = message.text.strip()
+
+    # Принимаем только целые числа
+    if not text.isdigit():
         await message.answer(
             f"❌ <b>Некорректный ввод.</b>\n\n"
-            f"Пожалуйста, введите число часов (например: <code>122</code> или <code>85.5</code>).\n"
-            f"Допустимый диапазон: от 0 до 744.",
+            f"Пожалуйста, введите <b>целое число</b> часов (например: <code>122</code>)",
             parse_mode="HTML"
         )
         return
 
-    hours = round(hours, 1)
+    hours = int(text)
+    if hours > 744:
+        await message.answer(
+            f"❌ <b>Слишком большое значение.</b>\n\n"
+            f"Максимум 744 часа. Введите корректное число:",
+            parse_mode="HTML"
+        )
+        return
+
     await state.update_data(hr_hours_entered=hours)
     await state.set_state(UserStates.confirming_entered_hours)
 
@@ -2083,11 +2202,10 @@ async def process_entering_hours(message: types.Message, state: FSMContext):
     ]])
 
     await message.answer(
-        f"Вы указали <b>{hours:.1f} ч</b> за <b>{month_name} {year}</b>.\n\nДанные верны?",
+        f"Вы указали <b>{hours} ч</b> за <b>{month_name} {year}</b>.\n\nДанные верны?",
         parse_mode="HTML",
         reply_markup=keyboard
     )
-
 
 @dp.message(StateFilter(UserStates.confirming_entered_hours))
 async def hours_confirm_pending_text(message: types.Message, state: FSMContext):
@@ -2104,7 +2222,7 @@ async def hours_confirm_pending_text(message: types.Message, state: FSMContext):
 
     await message.answer(
         f"⬆️ Пожалуйста, используйте кнопки для подтверждения.\n\n"
-        f"Вы указали <b>{hours:.1f} ч</b> за <b>{month_name} {year}</b>.\n\nДанные верны?",
+        f"Вы указали <b>{hours:.0f} ч</b> за <b>{month_name} {year}</b>.\n\nДанные верны?",
         parse_mode="HTML",
         reply_markup=keyboard
     )
@@ -2112,7 +2230,6 @@ async def hours_confirm_pending_text(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "hr_final_yes")
 async def hours_final_confirm_yes(callback: types.CallbackQuery, state: FSMContext):
-    """Сотрудник подтверждает введённые вручную часы."""
     user_id = callback.from_user.id
     user_data = await state.get_data()
 
@@ -2132,32 +2249,21 @@ async def hours_final_confirm_yes(callback: types.CallbackQuery, state: FSMConte
     except Exception:
         pass
 
-    # Подтверждаем сотруднику
     await callback.message.answer(
         f"✅ <b>Данные успешно переданы руководителю!</b>\n\n"
-        f"Ваши часы за <b>{month_name} {year}</b>: <b>{hours:.1f} ч</b>",
+        f"Ваши часы за <b>{month_name} {year}</b>: <b>{hours} ч</b>",
         parse_mode="HTML"
     )
-
-    # Уведомляем руководителя
-    try:
-        await bot.send_message(
-            director_id,
-            f"✏️ <b>{employee_name}</b> указал(а) количество часов "
-            f"за <b>{month_name} {year}</b>: <b>{hours:.1f} ч</b>",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"Не удалось уведомить руководителя {director_id}: {e}")
 
     pending_hour_checks.pop(user_id, None)
     await state.set_state(UserStates.main_menu)
     await callback.answer()
     await bot_logger.log_action(
         callback.from_user.username or str(user_id),
-        f"Указал(а) исправленные часы за {month_name} {year}: {hours:.1f} ч"
+        f"Указал(а) исправленные часы за {month_name} {year}: {hours} ч"
     )
 
+    await _record_hours_and_check_complete(director_id, employee_name, hours)
 
 @dp.callback_query(F.data == "hr_final_no")
 async def hours_final_confirm_no(callback: types.CallbackQuery, state: FSMContext):
@@ -2180,14 +2286,108 @@ async def hours_final_confirm_no(callback: types.CallbackQuery, state: FSMContex
     )
     await callback.answer()
 
+async def hours_check_reminder():
+    """Каждую минуту проверяет, не истёк ли час ожидания ответа на сверку часов.
+    Если да — удаляет старое сообщение и отправляет новое."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            now = moscow_now()
+            for employee_user_id, check in list(pending_hour_checks.items()):
+                sent_at = check.get('sent_at')
+                if not sent_at:
+                    continue
+                elapsed = (now - sent_at).total_seconds()
+                if elapsed < 3600:
+                    continue
+
+                # Час прошёл — удаляем старое сообщение и шлём новое
+                old_message_id = check.get('message_id')
+                if old_message_id:
+                    try:
+                        await bot.delete_message(employee_user_id, old_message_id)
+                    except Exception:
+                        pass
+
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="✅ Да", callback_data="hr_yes"),
+                    InlineKeyboardButton(text="✏️ Нет, изменить", callback_data="hr_no")
+                ]])
+
+                try:
+                    sent_msg = await bot.send_message(
+                        employee_user_id,
+                        f"📋 <b>Сообщение от руководителя:</b>\n\n"
+                        f"Привет! У тебя за <b>{check['month_name']} {check['year']}</b> — "
+                        f"<b>{check['hours']} ч</b>.\n\nДанные верны?",
+                        parse_mode="HTML",
+                        reply_markup=keyboard
+                    )
+                    pending_hour_checks[employee_user_id]['sent_at'] = now
+                    pending_hour_checks[employee_user_id]['message_id'] = sent_msg.message_id
+                except Exception as e:
+                    logger.error(f"Ошибка повторной отправки сверки для {employee_user_id}: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка в hours_check_reminder: {e}")
+
+async def seed_users():
+    """Предзаполняет БД заранее известными пользователями, ролями и именами."""
+
+    PREDEFINED_USERS = [
+        # (user_id, employee_name, role)  role: 'admin', 'director', 'user'
+        (662128557,  'Гришина Светлана',    'admin'),
+        (1791773663, 'Щемелинин Владислав', 'director'),
+        (1023700628, 'Щемелинин Владислав', 'director'),
+        (5205557617, 'Щемелинин Владислав', 'director'),
+        (721087112,  'Червякова Ольга',     'user'),
+        (902098427,  'Мишина Анна',         'user'),
+        (907480648,  'Кузнецова Алиса',     'user'),
+        (1141957939, 'Белов Дмитрий',       'user'),
+        (1232409927, 'Андреева Варвара',    'user'),
+        (1950565293, 'Толкачев Егор',       'user'),
+        (1949489221, 'Тимохина Дарья',      'user'),
+    ]
+
+    admin_id = access_control.admin_id
+
+    for user_id, employee_name, role in PREDEFINED_USERS:
+        try:
+            # Сохраняем в users (имя сотрудника)
+            await db.save_user(
+                user_id=user_id,
+                username=employee_name,
+                is_l15=True,
+                employee_name=employee_name
+            )
+
+            # Выдаём доступ в access_list
+            await access_control.grant_access(
+                user_id=user_id,
+                username=employee_name,
+                granted_by=admin_id
+            )
+
+            # Назначаем роль директора
+            if role == 'director':
+                await access_control.add_director(user_id, added_by=admin_id)
+
+            logger.info(f"Предзаполнен: {employee_name} (ID: {user_id}, роль: {role})")
+
+        except Exception as e:
+            logger.error(f"Ошибка предзаполнения пользователя {user_id}: {e}")
+
+    logger.info("Предзаполнение пользователей завершено.")
+
 async def main():
     """Запуск бота"""
     # Инициализация БД
     await db.init_db()
     await access_control.init_db()
+    await seed_users()
 
     # Запускаем фоновую задачу
     asyncio.create_task(reminder_checker())
+    asyncio.create_task(hours_check_reminder())
     asyncio.create_task(shift_counter_updater())
 
     logger.info("Бот запущен")
@@ -2364,8 +2564,18 @@ async def reminder_checker():
                                     'shift_start': shift_start,
                                     'shift_end': shift_end
                                 }
-                                await bot.pin_chat_message(chat_id=msg.chat.id, message_id=msg.message_id,
-                                                           disable_notification=True)
+                                await bot.pin_chat_message(
+                                    chat_id=msg.chat.id,
+                                    message_id=msg.message_id,
+                                    disable_notification=True
+                                )
+                                # ← ДОБАВИТЬ:
+                                await bot_logger.log_action(
+                                    f"user_{user_id}",
+                                    f"⏱ [{employee_name}] Запущен рублемер. "
+                                    f"Смена: {shift_start.strftime('%H:%M')}–{shift_end.strftime('%H:%M')}. "
+                                    f"Сообщение закреплено (ID: {msg.message_id})"
+                                )
                                 break
                         except Exception as e:
                             logger.debug(f"Ошибка запуска счётчика смены: {e}")
