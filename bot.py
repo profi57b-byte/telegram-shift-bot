@@ -6,6 +6,7 @@ import sys
 import glob
 from pathlib import Path
 from typing import Optional
+import aiosqlite
 
 import pytz  # добавлено для работы с часовыми поясами
 
@@ -34,6 +35,24 @@ excel_parser = ExcelParser(EXCEL_FILE)
 db = UserDatabase()
 access_control = AccessControl()
 bot_logger = BotLogger(bot, LOG_CHAT_ID)
+
+# Список сотрудников, участвующих в подменах
+SUBSTITUTION_EMPLOYEES = ["Ольга Червякова", "Светлана Гришина", "Анна Мишина"]
+
+def get_employee_user_ids_from_db_sync():
+    """Заглушка — реальный поиск делается через async функцию ниже."""
+    pass
+
+async def get_employee_user_id(employee_name: str) -> Optional[int]:
+    """Ищет user_id сотрудника по имени в БД."""
+    async with aiosqlite.connect(db.db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            'SELECT user_id FROM users WHERE employee_name = ?', (employee_name,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row['user_id'] if row else None
+
 # Словарь активных проверок часов: user_id сотрудника -> данные проверки
 pending_hour_checks: dict = {}
 # Сессия сверки часов: director_id -> {всего сотрудников, подтверждённые данные}
@@ -70,6 +89,9 @@ class UserStates(StatesGroup):
     director_choosing_employee = State()
     entering_hours = State()           # ← НОВОЕ
     confirming_entered_hours = State() # ← НОВОЕ
+    substitution_choosing_date = State()
+    substitution_choosing_from = State()
+    substitution_choosing_to = State()
 
 
 # Функция поиска Excel файла
@@ -235,6 +257,7 @@ def get_main_menu_keyboard(is_director=False):
             [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📅 Завтра")],
             [KeyboardButton(text="📅 Неделя"), KeyboardButton(text="📅 Дата")],
             [KeyboardButton(text="👥 Кто на смене?")],
+            [KeyboardButton(text="🔄 Нужна подмена")],  # НОВАЯ КНОПКА
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="⚙️ Настройки")],
             [KeyboardButton(text="ℹ️ О боте")]
         ]
@@ -2377,6 +2400,493 @@ async def seed_users():
             logger.error(f"Ошибка предзаполнения пользователя {user_id}: {e}")
 
     logger.info("Предзаполнение пользователей завершено.")
+
+# ===== БЛОК ПОДМЕНЫ =====
+
+def get_substitution_calendar_keyboard(year=None, month=None):
+    """Календарь для выбора даты подмены (только текущий месяц)."""
+    today = moscow_now()
+    if year is None or month is None:
+        year = today.year
+        month = today.month
+
+    import calendar as cal_module
+    keyboard = []
+    month_names = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+                   'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь']
+
+    keyboard.append([
+        InlineKeyboardButton(text=f"📆 {month_names[month - 1]} {year}", callback_data="sub_ignore")
+    ])
+    keyboard.append([
+        InlineKeyboardButton(text="Пн", callback_data="sub_ignore"),
+        InlineKeyboardButton(text="Вт", callback_data="sub_ignore"),
+        InlineKeyboardButton(text="Ср", callback_data="sub_ignore"),
+        InlineKeyboardButton(text="Чт", callback_data="sub_ignore"),
+        InlineKeyboardButton(text="Пт", callback_data="sub_ignore"),
+        InlineKeyboardButton(text="Сб", callback_data="sub_ignore"),
+        InlineKeyboardButton(text="Вс", callback_data="sub_ignore"),
+    ])
+
+    first_day = datetime(year, month, 1)
+    days_in_month = cal_module.monthrange(year, month)[1]
+    start_weekday = first_day.weekday()
+
+    week = []
+    for _ in range(start_weekday):
+        week.append(InlineKeyboardButton(text=" ", callback_data="sub_ignore"))
+
+    for day in range(1, days_in_month + 1):
+        date_str = f"{year}-{month:02d}-{day:02d}"
+        week.append(InlineKeyboardButton(text=str(day), callback_data=f"sub_date:{date_str}"))
+        if len(week) == 7:
+            keyboard.append(week)
+            week = []
+
+    if week:
+        while len(week) < 7:
+            week.append(InlineKeyboardButton(text=" ", callback_data="sub_ignore"))
+        keyboard.append(week)
+
+    keyboard.append([InlineKeyboardButton(text="◀️ Отмена", callback_data="sub_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+@dp.message(StateFilter(UserStates.main_menu), F.text == "🔄 Нужна подмена")
+async def substitution_start(message: types.Message, state: FSMContext):
+    """Начало процесса поиска подмены."""
+    user_data = await state.get_data()
+    employee_name = user_data.get('employee_name')
+
+    if not employee_name:
+        user_db = await db.get_user(message.from_user.id)
+        if user_db and user_db.get('employee_name'):
+            employee_name = user_db['employee_name']
+            await state.update_data(employee_name=employee_name)
+        else:
+            await message.answer("⚠️ Сначала выберите ваше имя через /start")
+            return
+
+    if employee_name not in SUBSTITUTION_EMPLOYEES:
+        await message.answer("⛔ Эта функция доступна только для сотрудников.")
+        return
+
+    await state.set_state(UserStates.substitution_choosing_date)
+    await message.answer(
+        "🔄 <b>Поиск подмены</b>\n\nВыберите дату, на которую нужна подмена:",
+        reply_markup=get_substitution_calendar_keyboard(),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(StateFilter(UserStates.substitution_choosing_date), F.data.startswith("sub_date:"))
+async def substitution_date_chosen(callback: types.CallbackQuery, state: FSMContext):
+    """Пользователь выбрал дату подмены."""
+    date_str = callback.data.split(":")[1]
+    selected_date = datetime.strptime(date_str, "%Y-%m-%d")
+
+    user_data = await state.get_data()
+    employee_name = user_data.get('employee_name')
+
+    # Получаем смены сотрудника на эту дату
+    shifts = excel_parser.get_employee_schedule(employee_name, selected_date)
+
+    if not shifts:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="sub_back_to_calendar")]
+        ])
+        await callback.message.edit_text(
+            f"📅 <b>{selected_date.strftime('%d.%m.%Y')}</b>\n\n"
+            f"В этот день у вас нет смен.",
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+        return
+
+    # Собираем все рабочие часы сотрудника в этот день
+    all_hours = set()
+    for shift in shifts:
+        try:
+            start_str, end_str = shift['time'].split('-')
+            start_h = int(start_str.split(':')[0])
+            end_h = int(end_str.split(':')[0])
+            # Если конец на следующий день
+            if end_h < start_h:
+                end_h += 24
+            for h in range(start_h, end_h):
+                all_hours.add(h % 24)
+        except:
+            continue
+
+    if not all_hours:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="sub_back_to_calendar")]
+        ])
+        await callback.message.edit_text(
+            f"⚠️ Не удалось определить часы смены на {selected_date.strftime('%d.%m.%Y')}.",
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+        return
+
+    # Сохраняем дату и доступные часы
+    sorted_hours = sorted(all_hours)
+    await state.update_data(
+        sub_date=date_str,
+        sub_available_hours=sorted_hours
+    )
+
+    # Строим клавиатуру с часами (кроме последнего)
+    # "С какого часа" — все часы кроме последнего
+    hours_for_from = sorted_hours[:-1]
+    keyboard_buttons = []
+    row = []
+    for h in hours_for_from:
+        row.append(InlineKeyboardButton(
+            text=f"{h:02d}:00",
+            callback_data=f"sub_from:{h}"
+        ))
+        if len(row) == 4:
+            keyboard_buttons.append(row)
+            row = []
+    if row:
+        keyboard_buttons.append(row)
+    keyboard_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="sub_back_to_calendar")])
+
+    shifts_str = ", ".join([s['time'] for s in shifts])
+    await state.set_state(UserStates.substitution_choosing_from)
+    await callback.message.edit_text(
+        f"📅 <b>{selected_date.strftime('%d.%m.%Y')}</b>\n"
+        f"Ваша смена: {shifts_str}\n\n"
+        f"С какого времени необходимо подменить?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(StateFilter(UserStates.substitution_choosing_from), F.data.startswith("sub_from:"))
+async def substitution_from_chosen(callback: types.CallbackQuery, state: FSMContext):
+    """Пользователь выбрал час начала подмены."""
+    from_hour = int(callback.data.split(":")[1])
+    user_data = await state.get_data()
+    available_hours = user_data.get('sub_available_hours', [])
+
+    await state.update_data(sub_from=from_hour)
+
+    # Часы ДО — все часы после выбранного (кроме первого из доступных)
+    hours_for_to = [h for h in available_hours if h > from_hour]
+    # Добавляем "конец последней смены" — последний час + 1
+    if available_hours:
+        last_h = available_hours[-1]
+        end_h = (last_h + 1) % 24
+        # Если end_h == 0, это полночь (24:00), добавим как специальный
+        if end_h not in hours_for_to:
+            hours_for_to.append(end_h if end_h != 0 else 24)
+
+    if not hours_for_to:
+        await callback.answer("⚠️ Нет доступных часов для окончания подмены.", show_alert=True)
+        return
+
+    keyboard_buttons = []
+    row = []
+    for h in sorted(hours_for_to):
+        display_h = h % 24
+        row.append(InlineKeyboardButton(
+            text=f"{display_h:02d}:00",
+            callback_data=f"sub_to:{h}"
+        ))
+        if len(row) == 4:
+            keyboard_buttons.append(row)
+            row = []
+    if row:
+        keyboard_buttons.append(row)
+    keyboard_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="sub_back_to_from")])
+
+    date_str = user_data.get('sub_date')
+    selected_date = datetime.strptime(date_str, "%Y-%m-%d")
+
+    await state.set_state(UserStates.substitution_choosing_to)
+    await callback.message.edit_text(
+        f"📅 <b>{selected_date.strftime('%d.%m.%Y')}</b>\n"
+        f"Начало подмены: <b>{from_hour:02d}:00</b>\n\n"
+        f"До какого времени необходима подмена?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(StateFilter(UserStates.substitution_choosing_to), F.data.startswith("sub_to:"))
+async def substitution_to_chosen(callback: types.CallbackQuery, state: FSMContext):
+    """Пользователь выбрал час окончания подмены — отправляем запросы коллегам."""
+    to_hour = int(callback.data.split(":")[1])
+    user_data = await state.get_data()
+    from_hour = user_data.get('sub_from')
+    date_str = user_data.get('sub_date')
+    employee_name = user_data.get('employee_name')
+
+    selected_date = datetime.strptime(date_str, "%Y-%m-%d")
+    time_range = f"{from_hour:02d}:00-{to_hour % 24:02d}:00"
+    date_display = selected_date.strftime('%d.%m.%Y')
+
+    # Подтверждение инициатору
+    await callback.message.edit_text(
+        f"✅ <b>Запрос на подмену отправлен</b>\n\n"
+        f"📅 Дата: {date_display}\n"
+        f"⏰ Время: {time_range}\n\n"
+        f"Ожидайте ответа коллег.",
+        parse_mode="HTML"
+    )
+
+    # Возвращаем в главное меню
+    await state.set_state(UserStates.main_menu)
+    await callback.message.answer(
+        "📋 Главное меню:",
+        reply_markup=get_main_menu_keyboard(is_director=False)
+    )
+
+    # Рассылаем остальным сотрудникам
+    other_employees = [e for e in SUBSTITUTION_EMPLOYEES if e != employee_name]
+    for other_name in other_employees:
+        other_user_id = await get_employee_user_id(other_name)
+        if not other_user_id:
+            continue
+
+        sub_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Подменю",
+                    callback_data=f"sub_accept:{employee_name}:{date_str}:{from_hour}:{to_hour}"
+                ),
+                InlineKeyboardButton(
+                    text="❌ Не смогу",
+                    callback_data=f"sub_decline:{employee_name}:{date_str}:{from_hour}:{to_hour}"
+                )
+            ]
+        ])
+        try:
+            await bot.send_message(
+                other_user_id,
+                f"🔄 <b>{employee_name}</b> ищет замену на\n"
+                f"📅 {date_display} {time_range}",
+                reply_markup=sub_keyboard,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить запрос подмены пользователю {other_user_id}: {e}")
+
+    await bot_logger.log_action(
+        callback.from_user.username or str(callback.from_user.id),
+        f"Запросил подмену на {date_display} {time_range}"
+    )
+
+
+@dp.callback_query(F.data.startswith("sub_accept:"))
+async def substitution_accept(callback: types.CallbackQuery, state: FSMContext):
+    """Коллега согласился подменить."""
+    parts = callback.data.split(":")
+    # формат: sub_accept:ИМЯ:ДАТА:ОТ:ДО
+    requester_name = parts[1]
+    date_str = parts[2]
+    from_hour = int(parts[3])
+    to_hour = int(parts[4])
+
+    selected_date = datetime.strptime(date_str, "%Y-%m-%d")
+    date_display = selected_date.strftime('%d.%m.%Y')
+    time_range = f"{from_hour:02d}:00-{to_hour % 24:02d}:00"
+
+    # Имя подменяющего
+    user_data = await state.get_data()
+    substitute_name = user_data.get('employee_name')
+    if not substitute_name:
+        user_db = await db.get_user(callback.from_user.id)
+        if user_db:
+            substitute_name = user_db.get('employee_name', 'Неизвестный')
+
+    # Обновляем расписание в JSON
+    _apply_substitution(date_str, from_hour, to_hour, requester_name, substitute_name)
+
+    # Меняем сообщение для подменяющего
+    await callback.message.edit_text(
+        f"✅ Вы согласились подменить сотрудника <b>{requester_name}</b>\n"
+        f"📅 {date_display} {time_range}",
+        parse_mode="HTML"
+    )
+
+    # Уведомляем инициатора
+    requester_id = await get_employee_user_id(requester_name)
+    if requester_id:
+        try:
+            await bot.send_message(
+                requester_id,
+                f"✅ <b>{substitute_name}</b> согласился(-ась) вас подменить!\n"
+                f"📅 {date_display} {time_range}",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось уведомить инициатора {requester_id}: {e}")
+
+    await bot_logger.log_action(
+        callback.from_user.username or str(callback.from_user.id),
+        f"Согласился подменить {requester_name} на {date_display} {time_range}"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("sub_decline:"))
+async def substitution_decline(callback: types.CallbackQuery):
+    """Коллега не может подменить."""
+    parts = callback.data.split(":")
+    requester_name = parts[1]
+    date_str = parts[2]
+    from_hour = int(parts[3])
+    to_hour = int(parts[4])
+
+    selected_date = datetime.strptime(date_str, "%Y-%m-%d")
+    date_display = selected_date.strftime('%d.%m.%Y')
+    time_range = f"{from_hour:02d}:00-{to_hour % 24:02d}:00"
+
+    await callback.message.edit_text(
+        f"❌ Вы отметили, что не сможете подменить сотрудника <b>{requester_name}</b>\n"
+        f"📅 {date_display} {time_range}",
+        parse_mode="HTML"
+    )
+
+    await bot_logger.log_action(
+        callback.from_user.username or str(callback.from_user.id),
+        f"Отказался подменить {requester_name} на {date_display} {time_range}"
+    )
+    await callback.answer()
+
+
+# --- Навигация "Назад" ---
+
+@dp.callback_query(F.data == "sub_cancel")
+async def substitution_cancel(callback: types.CallbackQuery, state: FSMContext):
+    """Отмена поиска подмены."""
+    await state.set_state(UserStates.main_menu)
+    await callback.message.edit_text("Поиск подмены отменён.")
+    await callback.message.answer(
+        "📋 Главное меню:",
+        reply_markup=get_main_menu_keyboard(is_director=False)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(
+    StateFilter(UserStates.substitution_choosing_date,
+                UserStates.substitution_choosing_from),
+    F.data == "sub_back_to_calendar"
+)
+async def substitution_back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
+    """Возврат к выбору даты."""
+    await state.set_state(UserStates.substitution_choosing_date)
+    await callback.message.edit_text(
+        "🔄 <b>Поиск подмены</b>\n\nВыберите дату, на которую нужна подмена:",
+        reply_markup=get_substitution_calendar_keyboard(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(StateFilter(UserStates.substitution_choosing_to), F.data == "sub_back_to_from")
+async def substitution_back_to_from(callback: types.CallbackQuery, state: FSMContext):
+    """Возврат к выбору часа 'с какого'."""
+    user_data = await state.get_data()
+    date_str = user_data.get('sub_date')
+    employee_name = user_data.get('employee_name')
+    selected_date = datetime.strptime(date_str, "%Y-%m-%d")
+
+    shifts = excel_parser.get_employee_schedule(employee_name, selected_date)
+    available_hours = user_data.get('sub_available_hours', [])
+    hours_for_from = available_hours[:-1]
+
+    keyboard_buttons = []
+    row = []
+    for h in hours_for_from:
+        row.append(InlineKeyboardButton(
+            text=f"{h:02d}:00",
+            callback_data=f"sub_from:{h}"
+        ))
+        if len(row) == 4:
+            keyboard_buttons.append(row)
+            row = []
+    if row:
+        keyboard_buttons.append(row)
+    keyboard_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="sub_back_to_calendar")])
+
+    shifts_str = ", ".join([s['time'] for s in shifts]) if shifts else ""
+    await state.set_state(UserStates.substitution_choosing_from)
+    await callback.message.edit_text(
+        f"📅 <b>{selected_date.strftime('%d.%m.%Y')}</b>\n"
+        f"Ваша смена: {shifts_str}\n\n"
+        f"С какого времени необходимо подменить?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "sub_ignore")
+async def sub_ignore_callback(callback: types.CallbackQuery):
+    await callback.answer()
+
+
+# --- Изменение JSON при подмене ---
+
+def _apply_substitution(date_str: str, from_hour: int, to_hour: int,
+                         requester_name: str, substitute_name: str):
+    """
+    Меняет ответственного в JSON-расписании для слотов подмены.
+    Слоты, которые попадают в диапазон [from_hour, to_hour), переназначаются
+    с requester_name на substitute_name.
+    """
+    try:
+        import json as _json
+        json_path = excel_parser.json_path
+
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = _json.load(f)
+
+        schedule = data.get('schedule', {})
+        day_entries = schedule.get(date_str, [])
+
+        changed = False
+        for entry in day_entries:
+            if entry.get('employee') != requester_name:
+                continue
+            time_str = entry.get('time', '')
+            try:
+                start_str, end_str = time_str.split('-')
+                slot_start_h = int(start_str.split(':')[0])
+                slot_end_h = int(end_str.split(':')[0])
+                if slot_end_h < slot_start_h:
+                    slot_end_h += 24
+            except:
+                continue
+
+            # Слот попадает в диапазон подмены [from_hour, to_hour)
+            if slot_start_h >= from_hour and slot_end_h <= to_hour:
+                entry['employee'] = substitute_name
+                changed = True
+
+        if changed:
+            with open(json_path, 'w', encoding='utf-8') as f:
+                _json.dump(data, f, ensure_ascii=False, indent=2)
+            # Перезагружаем данные в памяти парсера
+            excel_parser._load_from_json()
+            logger.info(
+                f"Подмена применена: {requester_name} -> {substitute_name} "
+                f"на {date_str} {from_hour:02d}:00-{to_hour:02d}:00"
+            )
+        else:
+            logger.warning(
+                f"Подмена: не найдены слоты для замены {requester_name} "
+                f"на {date_str} {from_hour:02d}:00-{to_hour:02d}:00"
+            )
+    except Exception as e:
+        logger.error(f"Ошибка применения подмены: {e}")
+
+# ===== КОНЕЦ БЛОКА ПОДМЕНЫ =====
 
 async def main():
     """Запуск бота"""
