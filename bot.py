@@ -2471,7 +2471,8 @@ async def substitution_start(message: types.Message, state: FSMContext):
             await message.answer("⚠️ Сначала выберите ваше имя через /start")
             return
 
-    if employee_name not in SUBSTITUTION_EMPLOYEES:
+    is_admin = access_control.is_admin(message.from_user.id)
+    if not is_admin and employee_name not in SUBSTITUTION_EMPLOYEES:
         await message.answer("⛔ Эта функция доступна только для сотрудников.")
         return
 
