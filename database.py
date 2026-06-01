@@ -12,9 +12,7 @@ class UserDatabase:
         self.db_path = db_path
 
     async def init_db(self):
-        """Инициализация БД: создаём таблицы users и user_settings."""
         async with aiosqlite.connect(self.db_path) as db:
-            # Таблица пользователей
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -25,13 +23,24 @@ class UserDatabase:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            # Таблица настроек
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS user_settings (
                     user_id INTEGER PRIMARY KEY,
                     remind_before_hour BOOLEAN DEFAULT 0,
                     daily_remind_time TEXT,
                     FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                )
+            ''')
+            # НОВАЯ ТАБЛИЦА
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS substitutions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date_str TEXT NOT NULL,
+                    from_hour INTEGER NOT NULL,
+                    to_hour INTEGER NOT NULL,
+                    requester_name TEXT NOT NULL,
+                    substitute_name TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             await db.commit()
@@ -131,6 +140,27 @@ class UserDatabase:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 'SELECT * FROM users WHERE employee_name IS NOT NULL AND employee_name != ""'
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def save_substitution(self, date_str: str, from_hour: int, to_hour: int,
+                                requester_name: str, substitute_name: str):
+        """Сохранить запись о подмене."""
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute('''
+                INSERT INTO substitutions (date_str, from_hour, to_hour, requester_name, substitute_name)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (date_str, from_hour, to_hour, requester_name, substitute_name))
+            await conn.commit()
+            logger.info(f"Подмена сохранена: {requester_name} -> {substitute_name} {date_str} {from_hour}-{to_hour}")
+
+    async def get_all_substitutions(self):
+        """Получить все сохранённые подмены."""
+        async with aiosqlite.connect(self.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(
+                    'SELECT * FROM substitutions ORDER BY created_at ASC'
             ) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]

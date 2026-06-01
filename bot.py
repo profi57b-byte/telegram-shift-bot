@@ -38,6 +38,10 @@ bot_logger = BotLogger(bot, LOG_CHAT_ID)
 
 # Список сотрудников, участвующих в подменах
 SUBSTITUTION_EMPLOYEES = ["Ольга Червякова", "Светлана Гришина", "Анна Мишина"]
+# Хранилище активных запросов подмены
+# ключ: "employee_name:date_str:from_hour:to_hour"
+# значение: {"accepted_by": None | str, "notified_user_ids": [int, ...]}
+substitution_requests: dict = {}
 
 def get_employee_user_ids_from_db_sync():
     """Заглушка — реальный поиск делается через async функцию ниже."""
@@ -2628,6 +2632,13 @@ async def substitution_to_chosen(callback: types.CallbackQuery, state: FSMContex
     time_range = f"{from_hour:02d}:00-{to_hour % 24:02d}:00"
     date_display = selected_date.strftime('%d.%m.%Y')
 
+    # Регистрируем запрос подмены
+    request_key = f"{employee_name}:{date_str}:{from_hour}:{to_hour}"
+    substitution_requests[request_key] = {
+        "accepted_by": None,
+        "notified_user_ids": []  # заполним ниже
+    }
+
     # Подтверждение инициатору
     await callback.message.edit_text(
         f"✅ <b>Запрос на подмену отправлен</b>\n\n"
@@ -2637,7 +2648,6 @@ async def substitution_to_chosen(callback: types.CallbackQuery, state: FSMContex
         parse_mode="HTML"
     )
 
-    # Возвращаем в главное меню
     await state.set_state(UserStates.main_menu)
     await callback.message.answer(
         "📋 Главное меню:",
@@ -2646,6 +2656,7 @@ async def substitution_to_chosen(callback: types.CallbackQuery, state: FSMContex
 
     # Рассылаем остальным сотрудникам
     other_employees = [e for e in SUBSTITUTION_EMPLOYEES if e != employee_name]
+    notified_ids = []
     for other_name in other_employees:
         other_user_id = await get_employee_user_id(other_name)
         if not other_user_id:
@@ -2664,27 +2675,33 @@ async def substitution_to_chosen(callback: types.CallbackQuery, state: FSMContex
             ]
         ])
         try:
-            await bot.send_message(
+            sent = await bot.send_message(
                 other_user_id,
                 f"🔄 <b>{employee_name}</b> ищет замену на\n"
                 f"📅 {date_display} {time_range}",
                 reply_markup=sub_keyboard,
                 parse_mode="HTML"
             )
+            notified_ids.append({
+                "user_id": other_user_id,
+                "message_id": sent.message_id,
+                "chat_id": sent.chat.id
+            })
         except Exception as e:
             logger.error(f"Не удалось отправить запрос подмены пользователю {other_user_id}: {e}")
+
+    # Сохраняем message_id всех уведомлённых
+    substitution_requests[request_key]["notified_user_ids"] = notified_ids
 
     await bot_logger.log_action(
         callback.from_user.username or str(callback.from_user.id),
         f"Запросил подмену на {date_display} {time_range}"
     )
 
-
 @dp.callback_query(F.data.startswith("sub_accept:"))
 async def substitution_accept(callback: types.CallbackQuery, state: FSMContext):
     """Коллега согласился подменить."""
     parts = callback.data.split(":")
-    # формат: sub_accept:ИМЯ:ДАТА:ОТ:ДО
     requester_name = parts[1]
     date_str = parts[2]
     from_hour = int(parts[3])
@@ -2694,6 +2711,20 @@ async def substitution_accept(callback: types.CallbackQuery, state: FSMContext):
     date_display = selected_date.strftime('%d.%m.%Y')
     time_range = f"{from_hour:02d}:00-{to_hour % 24:02d}:00"
 
+    request_key = f"{requester_name}:{date_str}:{from_hour}:{to_hour}"
+    request_info = substitution_requests.get(request_key)
+
+    # Если уже кто-то согласился — блокируем
+    if request_info and request_info.get("accepted_by") is not None:
+        await callback.message.edit_text(
+            f"ℹ️ Сотрудник <b>{requester_name}</b> искал замену на\n"
+            f"📅 {date_display} {time_range}\n\n"
+            f"Замена была найдена.",
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
     # Имя подменяющего
     user_data = await state.get_data()
     substitute_name = user_data.get('employee_name')
@@ -2702,8 +2733,12 @@ async def substitution_accept(callback: types.CallbackQuery, state: FSMContext):
         if user_db:
             substitute_name = user_db.get('employee_name', 'Неизвестный')
 
-    # Обновляем расписание в JSON
-    _apply_substitution(date_str, from_hour, to_hour, requester_name, substitute_name)
+    # Помечаем запрос как закрытый
+    if request_info is not None:
+        substitution_requests[request_key]["accepted_by"] = substitute_name
+
+    # Применяем подмену в расписании
+    await _apply_substitution_async(date_str, from_hour, to_hour, requester_name, substitute_name)
 
     # Меняем сообщение для подменяющего
     await callback.message.edit_text(
@@ -2711,6 +2746,25 @@ async def substitution_accept(callback: types.CallbackQuery, state: FSMContext):
         f"📅 {date_display} {time_range}",
         parse_mode="HTML"
     )
+
+    # Обновляем сообщения для остальных уведомлённых
+    if request_info:
+        for notified in request_info.get("notified_user_ids", []):
+            if notified["user_id"] == callback.from_user.id:
+                continue  # этот уже обновлён выше
+            try:
+                await bot.edit_message_text(
+                    chat_id=notified["chat_id"],
+                    message_id=notified["message_id"],
+                    text=(
+                        f"ℹ️ Сотрудник <b>{requester_name}</b> искал замену на\n"
+                        f"📅 {date_display} {time_range}\n\n"
+                        f"Замена была найдена."
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Не удалось обновить сообщение для {notified['user_id']}: {e}")
 
     # Уведомляем инициатора
     requester_id = await get_employee_user_id(requester_name)
@@ -2731,7 +2785,6 @@ async def substitution_accept(callback: types.CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-
 @dp.callback_query(F.data.startswith("sub_decline:"))
 async def substitution_decline(callback: types.CallbackQuery):
     """Коллега не может подменить."""
@@ -2745,6 +2798,20 @@ async def substitution_decline(callback: types.CallbackQuery):
     date_display = selected_date.strftime('%d.%m.%Y')
     time_range = f"{from_hour:02d}:00-{to_hour % 24:02d}:00"
 
+    request_key = f"{requester_name}:{date_str}:{from_hour}:{to_hour}"
+    request_info = substitution_requests.get(request_key)
+
+    # Если уже кто-то согласился — показываем соответствующий текст
+    if request_info and request_info.get("accepted_by") is not None:
+        await callback.message.edit_text(
+            f"ℹ️ Сотрудник <b>{requester_name}</b> искал замену на\n"
+            f"📅 {date_display} {time_range}\n\n"
+            f"Замена была найдена",
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
     await callback.message.edit_text(
         f"❌ Вы отметили, что не сможете подменить сотрудника <b>{requester_name}</b>\n"
         f"📅 {date_display} {time_range}",
@@ -2756,7 +2823,6 @@ async def substitution_decline(callback: types.CallbackQuery):
         f"Отказался подменить {requester_name} на {date_display} {time_range}"
     )
     await callback.answer()
-
 
 # --- Навигация "Назад" ---
 
@@ -2833,60 +2899,29 @@ async def sub_ignore_callback(callback: types.CallbackQuery):
 
 # --- Изменение JSON при подмене ---
 
-def _apply_substitution(date_str: str, from_hour: int, to_hour: int,
-                         requester_name: str, substitute_name: str):
+async def _apply_substitution_async(date_str: str, from_hour: int, to_hour: int,
+                                     requester_name: str, substitute_name: str):
     """
-    Меняет ответственного в JSON-расписании для слотов подмены.
-    Слоты, которые попадают в диапазон [from_hour, to_hour), переназначаются
-    с requester_name на substitute_name.
+    Применяет подмену:
+    1. Сохраняет в БД (персистентно).
+    2. Применяет к данным парсера в памяти (сразу работает без перезапуска).
     """
-    try:
-        import json as _json
-        json_path = excel_parser.json_path
+    # Сохраняем в БД
+    await db.save_substitution(date_str, from_hour, to_hour, requester_name, substitute_name)
 
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = _json.load(f)
+    # Применяем в памяти парсера
+    excel_parser.apply_substitutions([{
+        'date_str': date_str,
+        'from_hour': from_hour,
+        'to_hour': to_hour,
+        'requester_name': requester_name,
+        'substitute_name': substitute_name
+    }])
 
-        schedule = data.get('schedule', {})
-        day_entries = schedule.get(date_str, [])
-
-        changed = False
-        for entry in day_entries:
-            if entry.get('employee') != requester_name:
-                continue
-            time_str = entry.get('time', '')
-            try:
-                start_str, end_str = time_str.split('-')
-                slot_start_h = int(start_str.split(':')[0])
-                slot_end_h = int(end_str.split(':')[0])
-                if slot_end_h < slot_start_h:
-                    slot_end_h += 24
-            except:
-                continue
-
-            # Слот попадает в диапазон подмены [from_hour, to_hour)
-            if slot_start_h >= from_hour and slot_end_h <= to_hour:
-                entry['employee'] = substitute_name
-                changed = True
-
-        if changed:
-            with open(json_path, 'w', encoding='utf-8') as f:
-                _json.dump(data, f, ensure_ascii=False, indent=2)
-            # Перезагружаем данные в памяти парсера
-            excel_parser._load_from_json()
-            logger.info(
-                f"Подмена применена: {requester_name} -> {substitute_name} "
-                f"на {date_str} {from_hour:02d}:00-{to_hour:02d}:00"
-            )
-        else:
-            logger.warning(
-                f"Подмена: не найдены слоты для замены {requester_name} "
-                f"на {date_str} {from_hour:02d}:00-{to_hour:02d}:00"
-            )
-    except Exception as e:
-        logger.error(f"Ошибка применения подмены: {e}")
-
-# ===== КОНЕЦ БЛОКА ПОДМЕНЫ =====
+    logger.info(
+        f"Подмена применена: {requester_name} -> {substitute_name} "
+        f"на {date_str} {from_hour:02d}:00-{to_hour:02d}:00"
+    )
 
 async def main():
     """Запуск бота"""
@@ -2894,6 +2929,12 @@ async def main():
     await db.init_db()
     await access_control.init_db()
     await seed_users()
+
+    # НОВОЕ: загружаем подмены из БД и применяем к расписанию
+    saved_substitutions = await db.get_all_substitutions()
+    if saved_substitutions:
+        excel_parser.apply_substitutions(saved_substitutions)
+        logger.info(f"Восстановлено {len(saved_substitutions)} подмен из БД")
 
     # Запускаем фоновую задачу
     asyncio.create_task(reminder_checker())

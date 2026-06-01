@@ -442,3 +442,34 @@ class ExcelParser:
                 'schedule': shifts
             }
         return week
+
+    def apply_substitutions(self, substitutions: list):
+        """
+        Применяет список подмен к данным расписания в памяти.
+        Вызывается после загрузки/парсинга данных.
+        substitutions — список словарей с ключами:
+            date_str, from_hour, to_hour, requester_name, substitute_name
+        """
+        for sub in substitutions:
+            date_str = sub['date_str']
+            from_hour = int(sub['from_hour'])
+            to_hour = int(sub['to_hour'])
+            requester_name = sub['requester_name']
+            substitute_name = sub['substitute_name']
+
+            day_entries = self.schedule_data.get(date_str, [])
+            for entry in day_entries:
+                if entry.get('employee') != requester_name:
+                    continue
+                try:
+                    start_str, end_str = entry['time'].split('-')
+                    slot_start_h = int(start_str.split(':')[0])
+                    slot_end_h = int(end_str.split(':')[0])
+                    if slot_end_h < slot_start_h:
+                        slot_end_h += 24
+                except:
+                    continue
+                if slot_start_h >= from_hour and slot_end_h <= to_hour:
+                    entry['employee'] = substitute_name
+
+        logger.info(f"Применено {len(substitutions)} подмен к расписанию в памяти")
