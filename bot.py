@@ -7,6 +7,7 @@ import glob
 from pathlib import Path
 from typing import Optional
 import aiosqlite
+import re
 
 import pytz  # добавлено для работы с часовыми поясами
 
@@ -222,6 +223,7 @@ def get_main_menu_keyboard(is_director=False):
             [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📅 Завтра")],
             [KeyboardButton(text="📅 Неделя"), KeyboardButton(text="📅 Дата")],
             [KeyboardButton(text="👥 Кто на смене?"), KeyboardButton(text="📋 Сверка часов")],
+            [KeyboardButton(text="📝Обращения")],
             [KeyboardButton(text="📊 По сотрудникам"), KeyboardButton(text="📊 Отдел")],
             [KeyboardButton(text="ℹ️ О боте")]
         ]
@@ -1536,6 +1538,115 @@ async def show_current_shift(message: types.Message, state: FSMContext):
     """Показать текущего дежурного"""
     await cmd_whoisnow(message, state)
 
+# ---------- Обращения ----------
+@dp.message(StateFilter(UserStates.main_menu), F.text == "📝Обращения")
+async def appeals_main_menu(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    is_dir = await access_control.is_director(user_id) or access_control.is_admin(user_id)
+    if not is_dir:
+        await message.answer("⛔ Эта функция доступна только руководителям.")
+        return
+    await show_appeals_summary(message, state)
+
+async def show_appeals_summary(message_or_callback, state: FSMContext):
+    stats = parser.get_appeals_stats_current_month()
+    month_name = MONTH_NAMES_RU[stats['month']]
+    response = f"📊 <b>Сводка по обращениям за {month_name} {stats['year']}</b>\n\n"
+    response += f"Всего обращений: <b>{stats['total']}</b>\n"
+    response += f"В работе: <b>{stats['in_progress']}</b>\n"
+    response += f"Завершено: <b>{stats['completed']}</b>\n"
+    response += f"Создано тикетов: <b>{stats['ticket_created']}</b>\n"
+    response += f"Не внесено в Obsidian: <b>{stats['obsidian_missing']}</b>\n\n"
+    if stats['merge_request_urls']:
+        mr_links = []
+        for i, url in enumerate(stats['merge_request_urls']):
+            match = re.search(r'/merge_requests/(\d+)', url)
+            mr_num = match.group(1) if match else f"MR{i+1}"
+            mr_links.append(f'<a href="{url}">MR{mr_num}</a>')
+        response += "MR: " + ", ".join(mr_links) + "\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊По сотрудникам", callback_data="appeals_by_employee"),
+         InlineKeyboardButton(text="💼По клиентам", callback_data="appeals_by_client")],
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_menu")]
+    ])
+    if isinstance(message_or_callback, types.Message):
+        await message_or_callback.answer(response, parse_mode="HTML", reply_markup=keyboard)
+    else:
+        await message_or_callback.message.edit_text(response, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(F.data == "appeals_by_employee")
+async def appeals_choose_employee(callback: types.CallbackQuery, state: FSMContext):
+    employees = ["Гришина Светлана", "Мишина Анна", "Червякова Ольга"]
+    keyboard = []
+    for emp in employees:
+        keyboard.append([InlineKeyboardButton(text=emp, callback_data=f"appeals_emp:{emp}")])
+    keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="appeals_back_to_summary")])
+    await callback.message.edit_text(
+        "Обращения какого сотрудника вас интересуют?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+
+@dp.callback_query(F.data.startswith("appeals_emp:"))
+async def appeals_employee_stats(callback: types.CallbackQuery, state: FSMContext):
+    emp_name = callback.data.split(":", 1)[1]
+    now = moscow_now()
+    stats = parser.get_employee_appeals_stats(emp_name, now.year, now.month)
+    if stats['old_missing_obsidian'] > 0:
+        header = f"<b>У сотрудника есть {stats['old_missing_obsidian']} невнесённых в Obsidian обращения!</b>\n\n"
+    else:
+        header = ""
+    response = f"{header}📊 <b>Статистика обращений: {emp_name}</b>\n\n"
+    response += f"Внесено в Obsidian: <b>{stats['added_obsidian']}</b>\n"
+    response += f"В работе: <b>{stats['in_progress']}</b>\n"
+    response += f"Создано тикетов: <b>{stats['ticket_created']}</b>\n"
+    if stats['merge_request_urls']:
+        mr_links = []
+        for url in stats['merge_request_urls']:
+            match = re.search(r'/merge_requests/(\d+)', url)
+            mr_num = match.group(1) if match else "MR"
+            mr_links.append(f'<a href="{url}">MR{mr_num}</a>')
+        response += "MR: " + ", ".join(mr_links) + "\n"
+    if stats['tickets']:
+        response += "\nТикеты:\n"
+        for date_str, client, url in stats['tickets']:
+            try:
+                dt = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
+            except:
+                dt = date_str
+            response += f'<a href="{url}">{dt} [{client}]</a>\n'
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="appeals_by_employee")]
+    ])
+    await callback.message.edit_text(response, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(F.data == "appeals_by_client")
+async def appeals_client_stats(callback: types.CallbackQuery, state: FSMContext):
+    now = moscow_now()
+    year, month = now.year, now.month
+    client_stats = parser.get_client_appeals_stats(year, month)
+    month_name = MONTH_NAMES_RU[month]
+    response = f"📊 <b>Статистика по клиентам {month_name} {year}</b>\n\n"
+    for client, data in client_stats.items():
+        response += f"<b>{client}</b>\n"
+        response += f"Обращения: {data['total']}\n"
+        response += f"В работе: {data['in_progress']}\n"
+        response += f"Тикеты: {data['ticket']}\n"
+        if data['tickets']:
+            for date_str, responsible, url in data['tickets']:
+                try:
+                    dt = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
+                except:
+                    dt = date_str
+                response += f'<a href="{url}">[Тикет от {dt} ({responsible})]</a>\n'
+        response += "\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="appeals_back_to_summary")]
+    ])
+    await callback.message.edit_text(response, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(F.data == "appeals_back_to_summary")
+async def appeals_back_to_summary(callback: types.CallbackQuery, state: FSMContext):
+    await show_appeals_summary(callback, state)
 
 @dp.message(StateFilter(UserStates.main_menu), F.text == "📊 Статистика")
 async def show_stats_button(message: types.Message, state: FSMContext):

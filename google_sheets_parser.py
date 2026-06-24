@@ -27,6 +27,7 @@ class GoogleSheetsParser:
     def __init__(self, json_path=DATA_FILE):
         self.json_path = json_path
         self.employees = []
+        self.all_records = []  # будет заполнено в _load_data
         self.schedule_data = {}   # ключ: "YYYY-MM-DD", значение: список {"employee", "time"}
         self.last_update_time = 0
         self._load_data()
@@ -42,6 +43,8 @@ class GoogleSheetsParser:
         try:
             with open(self.json_path, 'r', encoding='utf-8') as f:
                 raw_data = json.load(f)
+            # сохраняем ВСЕ записи для анализа обращений
+            self.all_records = raw_data
         except Exception as e:
             logger.error(f"Ошибка чтения JSON: {e}")
             self.employees = []
@@ -80,6 +83,147 @@ class GoogleSheetsParser:
         self.employees = sorted(list(employees_set))
         self.last_update_time = time.time()
         logger.info(f"Загружено {len(schedule)} дней, {len(self.employees)} сотрудников из {self.json_path}")
+
+    # ------------------ Обращения ------------------
+    def is_appeal(self, entry):
+        """Проверяет, является ли запись обращением (хотя бы одно из полей не пустое)."""
+        fields = [
+            "Клиент", "Статус обращения", "Срок решения и комментарий",
+            "Решение (ссылка на тикет/ссылка на документацию)",
+            "Обращение клиента", "Статус внесения обращения в Obsidian",
+            "Ссылка на Merge Request"
+        ]
+        for f in fields:
+            val = entry.get(f, "").strip()
+            if val:
+                return True
+        return False
+
+    def get_appeals_for_month(self, year, month):
+        """Возвращает список обращений за указанный месяц."""
+        appeals = []
+        for entry in self.all_records:
+            date_str = entry.get("Дата", "")
+            if not date_str:
+                continue
+            try:
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+            except:
+                continue
+            if dt.year == year and dt.month == month and self.is_appeal(entry):
+                appeals.append(entry)
+        return appeals
+
+    def get_appeals_stats_current_month(self):
+        """Общая сводка по обращениям за текущий месяц."""
+        now = moscow_now()
+        return self._get_appeals_stats(now.year, now.month)
+
+    def _get_appeals_stats(self, year, month):
+        appeals = self.get_appeals_for_month(year, month)
+        total = len(appeals)
+        in_progress = 0
+        completed = 0
+        ticket_created = 0
+        obsidian_missing = 0
+        merge_request_urls = set()
+        import re
+        for a in appeals:
+            status = a.get("Статус обращения", "").strip()
+            if status == "В работе":
+                in_progress += 1
+            elif status == "Завершен":
+                completed += 1
+            elif status == "Создан тикет":
+                ticket_created += 1
+            obs_status = a.get("Статус внесения обращения в Obsidian", "").strip()
+            if obs_status in ("", "Требует добавления", "Написание инструкции"):
+                obsidian_missing += 1
+            mr = a.get("Ссылка на Merge Request", "").strip()
+            if mr:
+                merge_request_urls.add(mr)
+        return {
+            "year": year, "month": month,
+            "total": total,
+            "in_progress": in_progress,
+            "completed": completed,
+            "ticket_created": ticket_created,
+            "obsidian_missing": obsidian_missing,
+            "merge_request_urls": sorted(list(merge_request_urls))
+        }
+
+    def get_employee_appeals_stats(self, employee_name, year, month):
+        appeals = self.get_appeals_for_month(year, month)
+        emp_appeals = [a for a in appeals if a.get("Ответственный", "").strip() == employee_name]
+        total = len(emp_appeals)
+        added_obsidian = 0
+        in_progress = 0
+        ticket_created = 0
+        merge_request_urls = set()
+        tickets = []
+        old_missing = 0
+        today = moscow_now().date()
+        for a in emp_appeals:
+            status = a.get("Статус обращения", "").strip()
+            if status == "В работе":
+                in_progress += 1
+            elif status == "Создан тикет":
+                ticket_created += 1
+            obs_status = a.get("Статус внесения обращения в Obsidian", "").strip()
+            if obs_status == "Добавлена":
+                added_obsidian += 1
+            else:
+                try:
+                    dt = datetime.strptime(a.get("Дата", ""), "%Y-%m-%d").date()
+                    if (today - dt).days > 3:
+                        old_missing += 1
+                except:
+                    pass
+            mr = a.get("Ссылка на Merge Request", "").strip()
+            if mr:
+                merge_request_urls.add(mr)
+            if status == "Создан тикет":
+                url = a.get("Решение (ссылка на тикет/ссылка на документацию)", "").strip()
+                client = a.get("Клиент", "").strip()
+                date_str = a.get("Дата", "")
+                tickets.append((date_str, client, url))
+        return {
+            "employee_name": employee_name,
+            "total": total,
+            "added_obsidian": added_obsidian,
+            "in_progress": in_progress,
+            "ticket_created": ticket_created,
+            "merge_request_urls": sorted(list(merge_request_urls)),
+            "tickets": tickets,
+            "old_missing_obsidian": old_missing
+        }
+
+    def get_client_appeals_stats(self, year, month):
+        appeals = self.get_appeals_for_month(year, month)
+        clients = {}
+        for a in appeals:
+            client = a.get("Клиент", "").strip()
+            if not client:
+                continue
+            if client not in clients:
+                clients[client] = {
+                    "total": 0, "completed": 0, "ticket": 0, "in_progress": 0,
+                    "tickets": []
+                }
+            clients[client]["total"] += 1
+            status = a.get("Статус обращения", "").strip()
+            if status == "Завершен":
+                clients[client]["completed"] += 1
+            elif status == "Создан тикет":
+                clients[client]["ticket"] += 1
+                ticket_url = a.get("Решение (ссылка на тикет/ссылка на документацию)", "").strip()
+                responsible = a.get("Ответственный", "").strip()
+                date_str = a.get("Дата", "")
+                clients[client]["tickets"].append((date_str, responsible, ticket_url))
+            elif status == "В работе":
+                clients[client]["in_progress"] += 1
+        # Удаляем клиентов без обращений (на всякий случай, total всегда >0)
+        return {k: v for k, v in clients.items() if v["total"] > 0}
 
     def reload_data(self):
         """Принудительно перечитывает data.json."""
