@@ -1553,7 +1553,7 @@ async def show_appeals_summary(message_or_callback, state: FSMContext):
     month_name = MONTH_NAMES_RU[stats['month']]
     response = f"📊 <b>Сводка по обращениям за {month_name} {stats['year']}</b>\n\n"
     response += f"Всего обращений: <b>{stats['total']}</b>\n"
-    response += f"В работе: <b>{stats['in_progress']}</b>\n"
+    response += f"Из них в работе: <b>{stats['in_progress']}</b>\n"
     response += f"Завершено: <b>{stats['completed']}</b>\n"
     response += f"Создано тикетов: <b>{stats['ticket_created']}</b>\n"
     response += f"Не внесено в Obsidian: <b>{stats['obsidian_missing']}</b>\n\n"
@@ -1592,7 +1592,7 @@ async def appeals_employee_stats(callback: types.CallbackQuery, state: FSMContex
     now = moscow_now()
     stats = parser.get_employee_appeals_stats(emp_name, now.year, now.month)
     if stats['old_missing_obsidian'] > 0:
-        header = f"<b>У сотрудника есть {stats['old_missing_obsidian']} невнесённых в Obsidian обращения!</b>\n\n"
+        header = f"<b>У сотрудника есть невнесённые в Obsidian обращения! Количество: {stats['old_missing_obsidian']}</b>\n\n"
     else:
         header = ""
     response = f"{header}📊 <b>Статистика обращений: {emp_name}</b>\n\n"
@@ -1629,7 +1629,7 @@ async def appeals_client_stats(callback: types.CallbackQuery, state: FSMContext)
     for client, data in client_stats.items():
         response += f"<b>{client}</b>\n"
         response += f"Обращения: {data['total']}\n"
-        response += f"В работе: {data['in_progress']}\n"
+        response += f"Из них в работе: {data['in_progress']}\n"
         response += f"Тикеты: {data['ticket']}\n"
         if data['tickets']:
             for date_str, responsible, url in data['tickets']:

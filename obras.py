@@ -3,8 +3,7 @@ import json
 import time
 import sys
 
-# URL вашего веб-приложения Apps Script
-GAS_URL = "https://script.google.com/macros/s/AKfycbzgsEee3eUQzjKjORmJQLeMoO7-_J1NzyctwUhkJ85ZQiTOiVDbIrDsUPrQ9ZSdOW5o/exec"
+GAS_URL = "https://script.google.com/macros/s/AKfycbyCvyQ4olHYLela7UIWwwlb2TmhpW0pGTUe21JsRnIgmTti3DT4v-sRTb2ouVBxSqiH/exec"
 OUTPUT_FILE = "data.json"
 INTERVAL = 15  # секунд между запросами
 
@@ -38,7 +37,7 @@ def main():
     while True:
         success = fetch_and_save()
         if not success:
-            # Можно добавить паузу подлиннее при сбое, чтобы не долбить сервер
+            # При ошибке ждём подольше, чтобы не нагружать сервер
             time.sleep(INTERVAL * 2)
         else:
             time.sleep(INTERVAL)
