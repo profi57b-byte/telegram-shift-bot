@@ -114,6 +114,20 @@ class GoogleSheetsParser:
                 appeals.append(entry)
         return appeals
 
+    def get_in_progress_appeals(self, employee_name=None):
+        """Возвращает список обращений со статусом 'В работе'.
+        Если указан employee_name — только для этого сотрудника."""
+        in_progress = []
+        for record in self.all_records:
+            if not self.is_appeal(record):
+                continue
+            if record.get("Статус обращения", "").strip() != "В работе":
+                continue
+            if employee_name and record.get("Ответственный", "").strip() != employee_name:
+                continue
+            in_progress.append(record)
+        return in_progress
+
     def get_appeals_stats(self, year=None, month=None):
         """Статистика обращений за указанный месяц (по умолчанию текущий)."""
         if year is None or month is None:

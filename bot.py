@@ -231,7 +231,7 @@ def get_main_menu_keyboard(is_director=False):
         keyboard = [
             [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📅 Завтра")],
             [KeyboardButton(text="📅 Неделя"), KeyboardButton(text="📅 Дата")],
-            [KeyboardButton(text="👥 Кто на смене?")],
+            [KeyboardButton(text="👥 Кто на смене?"), KeyboardButton(text="📝Обращения")],
             [KeyboardButton(text="🔄 Нужна подмена")],  # НОВАЯ КНОПКА
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="⚙️ Настройки")],
             [KeyboardButton(text="ℹ️ О боте")]
@@ -753,6 +753,57 @@ async def cmd_today(message: types.Message, state: FSMContext):
 
     await message.answer(response, parse_mode="HTML")
 
+def format_in_progress_appeal(record):
+    """Форматирует одно обращение 'В работе' для вывода."""
+    # Дата и время
+    date_str = record.get("Дата", "")
+    time_str = record.get("Время", "")
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        formatted_date = dt.strftime("%d.%m.%Y")
+    except:
+        formatted_date = date_str
+    date_time_line = f"{formatted_date} {time_str}" if time_str else formatted_date
+
+    # Клиент и дежурный
+    client = record.get("Клиент", "").strip() or "—"
+    responsible = record.get("Ответственный", "").strip() or "—"
+    client_resp_line = f"{client}, {responsible}"
+
+    # Текст обращения (blockquote)
+    appeal_text = record.get("Обращение клиента", "").strip()
+    blockquote_line = ""
+    if appeal_text:
+        blockquote_line = f"Обращение клиента: <blockquote>{appeal_text}</blockquote>"
+
+    # Ссылка на решение/тикет
+    url = record.get("Решение (ссылка на тикет/ссылка на документацию)", "").strip()
+    link_line = ""
+    if url:
+        if "rdm.inventos.ru" in url:
+            label = "Тикет"
+        elif "mm.inventos.ru" in url:
+            label = "Обсуждение в MM"
+        else:
+            label = "Решение"
+        link_line = f'<a href="{url}">{label}</a>'
+
+    # Комментарий
+    comment = record.get("Срок решения и комментарий", "").strip()
+    comment_line = ""
+    if comment:
+        comment_line = f"Комментарий: <i>{comment}</i>"
+
+    # Собираем все строки
+    parts = [date_time_line, client_resp_line]
+    if blockquote_line:
+        parts.append(blockquote_line)
+    if link_line:
+        parts.append(link_line)
+    if comment_line:
+        parts.append(comment_line)
+
+    return "\n".join(parts)
 
 @dp.message(Command("tomorrow"))
 @dp.message(F.text == "📅 Завтра")
@@ -1541,11 +1592,6 @@ async def show_current_shift(message: types.Message, state: FSMContext):
 # ---------- Обращения (с навигацией по месяцам) ----------
 @dp.message(StateFilter(UserStates.main_menu), F.text == "📝Обращения")
 async def appeals_main_menu(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    is_dir = await access_control.is_director(user_id) or access_control.is_admin(user_id)
-    if not is_dir:
-        await message.answer("⛔ Эта функция доступна только руководителям.")
-        return
     now = moscow_now()
     await show_appeals_summary(message, state, now.year, now.month)
 
@@ -1597,6 +1643,7 @@ async def show_appeals_summary(target, state: FSMContext, year: int, month: int)
         nav_buttons,
         [InlineKeyboardButton(text="📊По сотрудникам", callback_data=f"appeals_by_employee:{year}:{month}"),
          InlineKeyboardButton(text="💼По клиентам", callback_data=f"appeals_by_client:{year}:{month}")],
+        [InlineKeyboardButton(text="📌Обращения в работе", callback_data="appeals_in_progress")],
         [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_menu")]
     ])
 
@@ -1684,6 +1731,8 @@ async def appeals_employee_stats(callback: types.CallbackQuery, state: FSMContex
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         nav_buttons,
+        [InlineKeyboardButton(text="📌Обращения в работе",
+                              callback_data=f"appeals_in_progress_emp:{emp_name}:{year}:{month}")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data=f"appeals_by_employee:{year}:{month}")]
     ])
     await callback.message.edit_text(response, parse_mode="HTML", reply_markup=keyboard)
@@ -1884,6 +1933,55 @@ async def _record_hours_and_check_complete(director_id: int, employee_name: str,
         logger.error(f"Ошибка отправки итогов сверки руководителю {director_id}: {e}")
 
     hours_check_sessions.pop(director_id, None)
+
+@dp.callback_query(F.data == "appeals_in_progress")
+async def show_in_progress_all(callback: types.CallbackQuery):
+    appeals = parser.get_in_progress_appeals()
+    if not appeals:
+        await callback.message.edit_text("📌 Нет обращений в работе.")
+        return
+
+    text = "📌 <b>Обращения в работе (все сотрудники)</b>\n\n"
+    parts = []
+    for rec in appeals:
+        parts.append(format_in_progress_appeal(rec))
+    text += "\n\n".join(parts)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад к сводке", callback_data="appeals_back_to_summary_current")]
+    ])
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(F.data == "appeals_back_to_summary_current")
+async def back_to_summary_current(callback: types.CallbackQuery, state: FSMContext):
+    now = moscow_now()
+    await show_appeals_summary(callback, state, now.year, now.month)
+
+@dp.callback_query(F.data.startswith("appeals_in_progress_emp:"))
+async def show_in_progress_employee(callback: types.CallbackQuery):
+    # data: appeals_in_progress_emp:Гришина Светлана:2026:6
+    parts = callback.data.split(":")
+    emp_name = parts[1]
+    year = int(parts[2])
+    month = int(parts[3])
+
+    appeals = parser.get_in_progress_appeals(employee_name=emp_name)
+    if not appeals:
+        await callback.message.edit_text(f"📌 У {emp_name} нет обращений в работе.")
+        return
+
+    text = f"📌 <b>Обращения в работе: {emp_name}</b>\n\n"
+    parts_text = []
+    for rec in appeals:
+        parts_text.append(format_in_progress_appeal(rec))
+    text += "\n\n".join(parts_text)
+
+    # Кнопка «Назад» возвращает к статистике сотрудника за тот же месяц
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад к статистике",
+                              callback_data=f"appeals_emp:{emp_name}:{year}:{month}")]
+    ])
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 # ============================================================
 # ФУНКЦИОНАЛ: СВЕРКА ЧАСОВ (для руководителей)
