@@ -17,21 +17,20 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
-from excel_parser import ExcelParser
+from google_sheets_parser import GoogleSheetsParser
 from logger import BotLogger
 from database import UserDatabase
 from access_control import AccessControl
 
 # Конфигурация
-BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN')
+BOT_TOKEN = os.getenv('BOT_TOKEN', '8541386736:AAHYU7EQnp2rDeVnAXmyRVeiOUmW7I91e6A')
 LOG_CHAT_ID = '-5242231135'  # Ваш ID чата для логов
-EXCEL_FILE = os.getenv('EXCEL_FILE', 'graph.xlsx')
 
 # Инициализация
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
-excel_parser = ExcelParser(EXCEL_FILE)
+parser = GoogleSheetsParser()
 db = UserDatabase()
 access_control = AccessControl()
 bot_logger = BotLogger(bot, LOG_CHAT_ID)
@@ -96,36 +95,6 @@ class UserStates(StatesGroup):
     substitution_choosing_date = State()
     substitution_choosing_from = State()
     substitution_choosing_to = State()
-
-
-# Функция поиска Excel файла
-def find_excel_file():
-    """Ищет любой Excel файл в текущей директории"""
-    # Сначала проверяем переменную окружения
-    env_file = os.getenv('EXCEL_FILE')
-    if env_file and Path(env_file).exists():
-        return env_file
-
-    # Ищем .xlsx файлы
-    xlsx_files = glob.glob("*.xlsx")
-    if xlsx_files:
-        return xlsx_files[0]
-
-    # Ищем .xls файлы
-    xls_files = glob.glob("*.xls")
-    if xls_files:
-        return xls_files[0]
-
-    return None
-
-# Находим Excel файл
-EXCEL_FILE = find_excel_file()
-if not EXCEL_FILE:
-    print("❌ КРИТИЧЕСКАЯ ОШИБКА: Не найден Excel файл!")
-    print("📝 Поместите файл графика (.xlsx или .xls) в директорию бота")
-    sys.exit(1)
-
-print(f"📊 Загружен Excel файл: {EXCEL_FILE}")
 
 # Middleware для логирования всех входящих сообщений (должен быть ПЕРВЫМ)
 @dp.message.middleware()
@@ -390,7 +359,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     else:
         # Новый пользователь – выбор имени
         await state.set_state(UserStates.choosing_name)
-        employees = excel_parser.get_employees()
+        employees = parser.get_employees()
         if not employees:
             await message.answer(
                 "⚠️ Не удалось загрузить список сотрудников.\n"
@@ -413,7 +382,7 @@ async def department_stats_start(message: types.Message, state: FSMContext):
         await message.answer("⛔ Эта функция доступна только руководителям.")
         return
 
-    available_months = excel_parser.get_available_months()
+    available_months = parser.get_available_months()
     if not available_months:
         await message.answer("⚠️ Нет доступных месяцев.")
         return
@@ -451,7 +420,7 @@ async def process_department_stats(callback: types.CallbackQuery, state: FSMCont
     month = int(month_str)
 
     # Получаем статистику
-    stats = excel_parser.get_department_stats(year, month)
+    stats = parser.get_department_stats(year, month)
     if not stats:
         await callback.message.edit_text("⚠️ Данные за этот месяц недоступны.")
         return
@@ -507,7 +476,7 @@ async def process_department_stats(callback: types.CallbackQuery, state: FSMCont
 @dp.callback_query(F.data == "back_to_dept_months")
 async def back_to_dept_months(callback: types.CallbackQuery, state: FSMContext):
     # Повторно показываем список месяцев
-    available_months = excel_parser.get_available_months()
+    available_months = parser.get_available_months()
     keyboard = []
     for month_data in available_months[:12]:
         month_name = month_data['month_name']
@@ -536,7 +505,7 @@ async def director_stats_choose_employee(message: types.Message, state: FSMConte
         await message.answer("⛔ Эта функция доступна только руководителям.")
         return
 
-    employees = excel_parser.get_employees()
+    employees = parser.get_employees()
     if not employees:
         await message.answer("⚠️ Нет списка сотрудников.")
         return
@@ -562,7 +531,7 @@ async def director_stats_choose_month(callback: types.CallbackQuery, state: FSMC
     await state.update_data(selected_employee=employee_name)
 
     # Получаем доступные месяцы
-    available_months = excel_parser.get_available_months()
+    available_months = parser.get_available_months()
     if not available_months:
         await callback.message.edit_text("⚠️ Нет доступных месяцев.")
         return
@@ -597,7 +566,7 @@ async def director_stats_show(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.edit_text("⚠️ Ошибка: сотрудник не выбран.")
         return
 
-    stats = excel_parser.get_employee_stats_for_month(employee_name, year, month)
+    stats = parser.get_employee_stats_for_month(employee_name, year, month)
     if not stats:
         await callback.message.edit_text("⚠️ Статистика за этот месяц недоступна.")
         return
@@ -649,7 +618,7 @@ async def director_stats_show(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "dir_stats_back_to_employees")
 async def director_stats_back_to_employees(callback: types.CallbackQuery, state: FSMContext):
     """Возврат к списку сотрудников."""
-    employees = excel_parser.get_employees()
+    employees = parser.get_employees()
     keyboard = []
     for emp in employees:
         keyboard.append([InlineKeyboardButton(text=emp, callback_data=f"dir_stats_emp:{emp}")])
@@ -670,7 +639,7 @@ async def director_stats_back_to_months(callback: types.CallbackQuery, state: FS
         await callback.message.edit_text("⚠️ Ошибка: сотрудник не выбран.")
         return
 
-    available_months = excel_parser.get_available_months()
+    available_months = parser.get_available_months()
     keyboard = []
     for month_data in available_months[:12]:
         month_name = month_data['month_name']
@@ -751,7 +720,7 @@ async def cmd_today(message: types.Message, state: FSMContext):
         else:
             # Отправляем на выбор имени
             await state.set_state(UserStates.choosing_name)
-            employees = excel_parser.get_employees()
+            employees = parser.get_employees()
             if employees:
                 await message.answer(
                     "⚠️ Сначала выберите ваше имя:",
@@ -769,8 +738,8 @@ async def cmd_today(message: types.Message, state: FSMContext):
     )
 
     today = moscow_now()  # изменено
-    schedule = excel_parser.get_schedule_for_date(today)
-    all_employees = excel_parser.get_employees()
+    schedule = parser.get_schedule_for_date(today)
+    all_employees = parser.get_employees()
 
     response = f"📅 <b>Расписание на {today.strftime('%d.%m.%Y')} ({_get_weekday(today)})</b>\n\n"
 
@@ -797,7 +766,7 @@ async def cmd_tomorrow(message: types.Message, state: FSMContext):
             await state.update_data(employee_name=employee_name)
         else:
             await state.set_state(UserStates.choosing_name)
-            employees = excel_parser.get_employees()
+            employees = parser.get_employees()
             if employees:
                 await message.answer(
                     "⚠️ Сначала выберите ваше имя:",
@@ -815,8 +784,8 @@ async def cmd_tomorrow(message: types.Message, state: FSMContext):
     )
 
     tomorrow = moscow_now() + timedelta(days=1)  # изменено
-    schedule = excel_parser.get_schedule_for_date(tomorrow)
-    all_employees = excel_parser.get_employees()
+    schedule = parser.get_schedule_for_date(tomorrow)
+    all_employees = parser.get_employees()
 
     response = f"📅 <b>Расписание на {tomorrow.strftime('%d.%m.%Y')} ({_get_weekday(tomorrow)})</b>\n\n"
 
@@ -843,7 +812,7 @@ async def cmd_week(message: types.Message, state: FSMContext):
             await state.update_data(employee_name=employee_name)
         else:
             await state.set_state(UserStates.choosing_name)
-            employees = excel_parser.get_employees()
+            employees = parser.get_employees()
             if employees:
                 await message.answer(
                     "⚠️ Сначала выберите ваше имя:",
@@ -861,7 +830,7 @@ async def cmd_week(message: types.Message, state: FSMContext):
     )
 
     today = moscow_now()  # изменено
-    all_employees = excel_parser.get_employees()
+    all_employees = parser.get_employees()
 
     response = "📅 <b>Расписание на неделю</b>\n\n"
     weekdays_short = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
@@ -869,7 +838,7 @@ async def cmd_week(message: types.Message, state: FSMContext):
 
     for i in range(7):
         date = today + timedelta(days=i)
-        schedule = excel_parser.get_schedule_for_date(date)
+        schedule = parser.get_schedule_for_date(date)
         if schedule:
             has_data = True
             response += f"<b>{weekdays_short[date.weekday()]} {date.strftime('%d.%m')}</b>\n"
@@ -980,7 +949,7 @@ async def cmd_whoisnow(message: types.Message, state: FSMContext):
         "Запросил текущего дежурного"
     )
 
-    current_employee = excel_parser.get_current_employee()
+    current_employee = parser.get_current_employee()
 
     if current_employee:
         response = f"👤 <b>Сейчас на смене:</b>\n\n{current_employee['name']}\n⏰ {current_employee['time']}"
@@ -1006,7 +975,7 @@ async def cmd_stats(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Сначала выберите свое имя через /start")
         return
 
-    available_months = excel_parser.get_available_months()
+    available_months = parser.get_available_months()
 
     if not available_months:
         await message.answer("⚠️ Нет доступных месяцев для просмотра статистики")
@@ -1421,7 +1390,7 @@ async def disable_daily_remind(message: types.Message, state: FSMContext):
 @dp.message(StateFilter(UserStates.choosing_name))
 async def process_name_selection(message: types.Message, state: FSMContext):
     """Обработка выбора имени сотрудника"""
-    employees = excel_parser.get_employees()
+    employees = parser.get_employees()
 
     # Проверяем, есть ли имя в списке
     if message.text in employees:
@@ -1612,7 +1581,7 @@ async def change_name_button(message: types.Message, state: FSMContext):
         "Открыл меню изменения имени"
     )
 
-    employees = excel_parser.get_employees()
+    employees = parser.get_employees()
     await state.set_state(UserStates.choosing_name)
     await message.answer(
         "Выберите новое имя из списка:",
@@ -1740,7 +1709,7 @@ async def hours_check_broadcast(message: types.Message, state: FSMContext):
             continue
 
         try:
-            stats = excel_parser.get_employee_stats_for_month(employee_name, year, month)
+            stats = parser.get_employee_stats_for_month(employee_name, year, month)
             hours = int(stats['total_hours']) if stats else 0
         except Exception as e:
             logger.error(f"Ошибка получения часов для {employee_name}: {e}")
@@ -1874,7 +1843,7 @@ async def process_calendar_navigation(callback: types.CallbackQuery):
     year = int(year_str)
     month = int(month_str)
 
-    available_months = excel_parser.get_available_months()
+    available_months = parser.get_available_months()
     month_exists = any(m['year'] == year and m['month'] == month for m in available_months)
 
     if not month_exists:
@@ -1915,7 +1884,7 @@ async def process_date_selection(callback: types.CallbackQuery, state: FSMContex
     )
 
     # Проверяем доступность месяца
-    available_months = excel_parser.get_available_months()
+    available_months = parser.get_available_months()
     month_exists = any(
         m['year'] == selected_date.year and m['month'] == selected_date.month
         for m in available_months
@@ -1937,8 +1906,8 @@ async def process_date_selection(callback: types.CallbackQuery, state: FSMContex
         )
         return
 
-    schedule = excel_parser.get_schedule_for_date(selected_date) or []
-    all_employees = excel_parser.get_employees()
+    schedule = parser.get_schedule_for_date(selected_date) or []
+    all_employees = parser.get_employees()
 
     response = f"📅 <b>Расписание на {selected_date.strftime('%d.%m.%Y')} ({_get_weekday(selected_date)})</b>\n\n"
     response += _format_full_day_schedule(all_employees, schedule, employee_name)
@@ -1977,7 +1946,7 @@ async def process_stats_selection(callback: types.CallbackQuery, state: FSMConte
     year = int(year_str)
     month = int(month_str)
 
-    stats = excel_parser.get_employee_stats_for_month(employee_name, year, month)
+    stats = parser.get_employee_stats_for_month(employee_name, year, month)
     if not stats:
         await callback.message.edit_text("⚠️ Статистика за этот месяц недоступна")
         return
@@ -2097,14 +2066,6 @@ async def shift_counter_updater():
                         text=text,
                         parse_mode="HTML"
                     )
-
-                    # Логируем каждые 30 минут (чтобы не спамить)
-                    if int(elapsed_minutes) % 30 == 0 and int(elapsed_minutes) > 0:
-                        await bot_logger.log_action(
-                            f"user_{user_id}",
-                            f"⏱ Рублемер: {earned:.2f} руб., осталось {rem_hours} ч. {rem_minutes:02d} мин. "
-                            f"(сообщение ID: {message_id})"
-                        )
 
             except Exception as e:
                 logger.debug(f"shift_counter_updater: {e}")
@@ -2494,7 +2455,7 @@ async def substitution_date_chosen(callback: types.CallbackQuery, state: FSMCont
     employee_name = user_data.get('employee_name')
 
     # Получаем смены сотрудника на эту дату
-    shifts = excel_parser.get_employee_schedule(employee_name, selected_date)
+    shifts = parser.get_employee_schedule(employee_name, selected_date)
 
     if not shifts:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -2863,7 +2824,7 @@ async def substitution_back_to_from(callback: types.CallbackQuery, state: FSMCon
     employee_name = user_data.get('employee_name')
     selected_date = datetime.strptime(date_str, "%Y-%m-%d")
 
-    shifts = excel_parser.get_employee_schedule(employee_name, selected_date)
+    shifts = parser.get_employee_schedule(employee_name, selected_date)
     available_hours = user_data.get('sub_available_hours', [])
     hours_for_from = available_hours[:-1]
 
@@ -2911,7 +2872,7 @@ async def _apply_substitution_async(date_str: str, from_hour: int, to_hour: int,
     await db.save_substitution(date_str, from_hour, to_hour, requester_name, substitute_name)
 
     # Применяем в памяти парсера
-    excel_parser.apply_substitutions([{
+    parser.apply_substitutions([{
         'date_str': date_str,
         'from_hour': from_hour,
         'to_hour': to_hour,
@@ -2934,7 +2895,7 @@ async def main():
     # НОВОЕ: загружаем подмены из БД и применяем к расписанию
     saved_substitutions = await db.get_all_substitutions()
     if saved_substitutions:
-        excel_parser.apply_substitutions(saved_substitutions)
+        parser.apply_substitutions(saved_substitutions)
         logger.info(f"Восстановлено {len(saved_substitutions)} подмен из БД")
 
     # Запускаем фоновую задачу
@@ -3060,7 +3021,7 @@ async def reminder_checker():
                 # Напоминание за час до смены
                 if remind_before_hour:
                     # Получаем объединённые смены на сегодня для этого сотрудника
-                    shifts_today = excel_parser.get_employee_schedule(employee_name, now)
+                    shifts_today = parser.get_employee_schedule(employee_name, now)
                     if shifts_today:
                         for shift in shifts_today:
                             try:
@@ -3088,7 +3049,7 @@ async def reminder_checker():
                                 continue
 
                 # Запуск счётчика при начале смены
-                shifts_today = excel_parser.get_employee_schedule(employee_name, now)
+                shifts_today = parser.get_employee_schedule(employee_name, now)
                 if shifts_today and user_id not in active_shift_counters:
                     for shift in shifts_today:
                         try:
@@ -3114,7 +3075,8 @@ async def reminder_checker():
                                     'message_id': msg.message_id,
                                     'chat_id': msg.chat.id,
                                     'shift_start': shift_start,
-                                    'shift_end': shift_end
+                                    'shift_end': shift_end,
+                                    'employee_name': employee_name
                                 }
                                 await bot.pin_chat_message(
                                     chat_id=msg.chat.id,
@@ -3135,14 +3097,14 @@ async def reminder_checker():
                 # Ежедневное напоминание (о завтрашней смене)
                 if daily_time and current_time_str == daily_time:
                     tomorrow = now.date() + timedelta(days=1)
-                    schedule_tomorrow = excel_parser.get_schedule_for_date(datetime.combine(tomorrow, datetime.min.time()))
+                    schedule_tomorrow = parser.get_schedule_for_date(datetime.combine(tomorrow, datetime.min.time()))
                     if schedule_tomorrow:
                         shifts_tomorrow = [e for e in schedule_tomorrow if e['employee'] == employee_name]
                         if shifts_tomorrow:
                             # Объединяем смены (можно использовать ту же логику, что и в расписании)
                             # Для простоты возьмём первую
                             # Лучше использовать get_employee_schedule, но он возвращает уже объединённые
-                            emp_shifts = excel_parser.get_employee_schedule(employee_name, datetime.combine(tomorrow, datetime.min.time()))
+                            emp_shifts = parser.get_employee_schedule(employee_name, datetime.combine(tomorrow, datetime.min.time()))
                             if emp_shifts:
                                 times = ", ".join([s['time'] for s in emp_shifts])
                                 await bot.send_message(
@@ -3155,6 +3117,10 @@ async def reminder_checker():
                                     f"user_{user_id}",
                                     f"Отправлено ежедневное напоминание о завтрашней смене"
                                 )
+            # === ОБНОВЛЕНИЕ ДАННЫХ ИЗ JSON ===
+            parser.reload_data()
+            logger.debug("Расписание обновлено из data.json")
+            # ==================================
         except Exception as e:
             logger.error(f"Ошибка в reminder_checker: {e}")
 

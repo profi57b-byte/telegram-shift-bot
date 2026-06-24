@@ -53,3 +53,9 @@ Thumbs.db
 
 # Telegram bot specific
 session_*.dat
+
+# Виртуальное окружение (у вас .venv)
+.venv/
+
+# Сгенерированный JSON с данными из Google Таблиц
+data.json
