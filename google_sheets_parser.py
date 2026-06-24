@@ -114,10 +114,42 @@ class GoogleSheetsParser:
                 appeals.append(entry)
         return appeals
 
-    def get_appeals_stats_current_month(self):
-        """Общая сводка по обращениям за текущий месяц."""
-        now = moscow_now()
-        return self._get_appeals_stats(now.year, now.month)
+    def get_appeals_stats(self, year=None, month=None):
+        """Статистика обращений за указанный месяц (по умолчанию текущий)."""
+        if year is None or month is None:
+            now = moscow_now()
+            year = now.year
+            month = now.month
+        appeals = self.get_appeals_for_month(year, month)
+        total = len(appeals)
+        in_progress = 0
+        completed = 0
+        ticket_created = 0
+        obsidian_missing = 0
+        merge_request_urls = set()
+        for a in appeals:
+            status = a.get("Статус обращения", "").strip()
+            if status == "В работе":
+                in_progress += 1
+            elif status == "Завершен":
+                completed += 1
+            elif status == "Создан тикет":
+                ticket_created += 1
+            obs_status = a.get("Статус внесения обращения в Obsidian", "").strip()
+            if obs_status in ("", "Требует добавления", "Написание инструкции"):
+                obsidian_missing += 1
+            mr = a.get("Ссылка на Merge Request", "").strip()
+            if mr:
+                merge_request_urls.add(mr)
+        return {
+            "year": year, "month": month,
+            "total": total,
+            "in_progress": in_progress,
+            "completed": completed,
+            "ticket_created": ticket_created,
+            "obsidian_missing": obsidian_missing,
+            "merge_request_urls": sorted(list(merge_request_urls))
+        }
 
     def _get_appeals_stats(self, year, month):
         appeals = self.get_appeals_for_month(year, month)

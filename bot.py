@@ -1538,7 +1538,7 @@ async def show_current_shift(message: types.Message, state: FSMContext):
     """Показать текущего дежурного"""
     await cmd_whoisnow(message, state)
 
-# ---------- Обращения ----------
+# ---------- Обращения (с навигацией по месяцам) ----------
 @dp.message(StateFilter(UserStates.main_menu), F.text == "📝Обращения")
 async def appeals_main_menu(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -1546,14 +1546,15 @@ async def appeals_main_menu(message: types.Message, state: FSMContext):
     if not is_dir:
         await message.answer("⛔ Эта функция доступна только руководителям.")
         return
-    await show_appeals_summary(message, state)
+    now = moscow_now()
+    await show_appeals_summary(message, state, now.year, now.month)
 
-async def show_appeals_summary(message_or_callback, state: FSMContext):
-    stats = parser.get_appeals_stats_current_month()
-    month_name = MONTH_NAMES_RU[stats['month']]
-    response = f"📊 <b>Сводка по обращениям за {month_name} {stats['year']}</b>\n\n"
+async def show_appeals_summary(target, state: FSMContext, year: int, month: int):
+    stats = parser.get_appeals_stats(year, month)
+    month_name = MONTH_NAMES_RU[month]
+    response = f"📊 <b>Сводка по обращениям за {month_name} {year}</b>\n\n"
     response += f"Всего обращений: <b>{stats['total']}</b>\n"
-    response += f"Из них в работе: <b>{stats['in_progress']}</b>\n"
+    response += f"В работе: <b>{stats['in_progress']}</b>\n"
     response += f"Завершено: <b>{stats['completed']}</b>\n"
     response += f"Создано тикетов: <b>{stats['ticket_created']}</b>\n"
     response += f"Не внесено в Obsidian: <b>{stats['obsidian_missing']}</b>\n\n"
@@ -1564,23 +1565,62 @@ async def show_appeals_summary(message_or_callback, state: FSMContext):
             mr_num = match.group(1) if match else f"MR{i+1}"
             mr_links.append(f'<a href="{url}">MR{mr_num}</a>')
         response += "MR: " + ", ".join(mr_links) + "\n"
+
+    # Определяем, можно ли перейти в предыдущий/следующий месяц
+    now = moscow_now()
+    prev_month = month - 1 if month > 1 else 12
+    prev_year = year if month > 1 else year - 1
+    next_month = month + 1 if month < 12 else 1
+    next_year = year if month < 12 else year + 1
+
+    # Проверяем наличие данных в соседних месяцах
+    has_prev = len(parser.get_appeals_for_month(prev_year, prev_month)) > 0
+    # Будущие месяцы, где нет данных, не показываем активными
+    future = (next_year > now.year) or (next_year == now.year and next_month > now.month)
+    has_next = (not future) and len(parser.get_appeals_for_month(next_year, next_month)) > 0
+
+    nav_buttons = []
+    # Кнопка предыдущего месяца (если данных нет, делаем неактивную с пробелом)
+    if has_prev:
+        nav_buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"appeals_nav:summary:{prev_year}:{prev_month}"))
+    else:
+        nav_buttons.append(InlineKeyboardButton(text=" ", callback_data="ignore"))
+    # Текущий месяц (не нажимается)
+    nav_buttons.append(InlineKeyboardButton(text=f"📆 {month_name} {year}", callback_data="ignore"))
+    # Кнопка следующего месяца
+    if has_next:
+        nav_buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"appeals_nav:summary:{next_year}:{next_month}"))
+    else:
+        nav_buttons.append(InlineKeyboardButton(text=" ", callback_data="ignore"))
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊По сотрудникам", callback_data="appeals_by_employee"),
-         InlineKeyboardButton(text="💼По клиентам", callback_data="appeals_by_client")],
+        nav_buttons,
+        [InlineKeyboardButton(text="📊По сотрудникам", callback_data=f"appeals_by_employee:{year}:{month}"),
+         InlineKeyboardButton(text="💼По клиентам", callback_data=f"appeals_by_client:{year}:{month}")],
         [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_menu")]
     ])
-    if isinstance(message_or_callback, types.Message):
-        await message_or_callback.answer(response, parse_mode="HTML", reply_markup=keyboard)
-    else:
-        await message_or_callback.message.edit_text(response, parse_mode="HTML", reply_markup=keyboard)
 
-@dp.callback_query(F.data == "appeals_by_employee")
+    if isinstance(target, types.Message):
+        await target.answer(response, parse_mode="HTML", reply_markup=keyboard)
+    else:
+        await target.message.edit_text(response, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("appeals_nav:summary:"))
+async def appeals_nav_summary(callback: types.CallbackQuery, state: FSMContext):
+    _, _, year_str, month_str = callback.data.split(":")
+    await show_appeals_summary(callback, state, int(year_str), int(month_str))
+
+@dp.callback_query(F.data.startswith("appeals_by_employee:"))
 async def appeals_choose_employee(callback: types.CallbackQuery, state: FSMContext):
+    # data: appeals_by_employee:2026:6
+    parts = callback.data.split(":")
+    year = int(parts[1])
+    month = int(parts[2])
     employees = ["Гришина Светлана", "Мишина Анна", "Червякова Ольга"]
     keyboard = []
     for emp in employees:
-        keyboard.append([InlineKeyboardButton(text=emp, callback_data=f"appeals_emp:{emp}")])
-    keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="appeals_back_to_summary")])
+        keyboard.append([InlineKeyboardButton(text=emp, callback_data=f"appeals_emp:{emp}:{year}:{month}")])
+    keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"appeals_nav:summary:{year}:{month}")])
     await callback.message.edit_text(
         "Обращения какого сотрудника вас интересуют?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -1588,14 +1628,19 @@ async def appeals_choose_employee(callback: types.CallbackQuery, state: FSMConte
 
 @dp.callback_query(F.data.startswith("appeals_emp:"))
 async def appeals_employee_stats(callback: types.CallbackQuery, state: FSMContext):
-    emp_name = callback.data.split(":", 1)[1]
-    now = moscow_now()
-    stats = parser.get_employee_appeals_stats(emp_name, now.year, now.month)
+    # appeals_emp:Гришина Светлана:2026:6
+    parts = callback.data.split(":")
+    emp_name = parts[1]
+    year = int(parts[2])
+    month = int(parts[3])
+    stats = parser.get_employee_appeals_stats(emp_name, year, month)
+
+    month_name = MONTH_NAMES_RU[month]
     if stats['old_missing_obsidian'] > 0:
-        header = f"<b>У сотрудника есть невнесённые в Obsidian обращения! Количество: {stats['old_missing_obsidian']}</b>\n\n"
+        header = f"<b>У сотрудника есть {stats['old_missing_obsidian']} невнесённых в Obsidian обращения!</b>\n\n"
     else:
         header = ""
-    response = f"{header}📊 <b>Статистика обращений: {emp_name}</b>\n\n"
+    response = f"{header}📊 <b>Статистика обращений: {emp_name} ({month_name} {year})</b>\n\n"
     response += f"Внесено в Obsidian: <b>{stats['added_obsidian']}</b>\n"
     response += f"В работе: <b>{stats['in_progress']}</b>\n"
     response += f"Создано тикетов: <b>{stats['ticket_created']}</b>\n"
@@ -1614,39 +1659,107 @@ async def appeals_employee_stats(callback: types.CallbackQuery, state: FSMContex
             except:
                 dt = date_str
             response += f'<a href="{url}">{dt} [{client}]</a>\n'
+
+    # Навигация для статистики сотрудника
+    now = moscow_now()
+    prev_month = month - 1 if month > 1 else 12
+    prev_year = year if month > 1 else year - 1
+    next_month = month + 1 if month < 12 else 1
+    next_year = year if month < 12 else year + 1
+
+    has_prev = len(parser.get_appeals_for_month(prev_year, prev_month)) > 0
+    future = (next_year > now.year) or (next_year == now.year and next_month > now.month)
+    has_next = (not future) and len(parser.get_appeals_for_month(next_year, next_month)) > 0
+
+    nav_buttons = []
+    if has_prev:
+        nav_buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"appeals_emp_nav:{emp_name}:{prev_year}:{prev_month}"))
+    else:
+        nav_buttons.append(InlineKeyboardButton(text=" ", callback_data="ignore"))
+    nav_buttons.append(InlineKeyboardButton(text=f"📆 {month_name} {year}", callback_data="ignore"))
+    if has_next:
+        nav_buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"appeals_emp_nav:{emp_name}:{next_year}:{next_month}"))
+    else:
+        nav_buttons.append(InlineKeyboardButton(text=" ", callback_data="ignore"))
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="appeals_by_employee")]
+        nav_buttons,
+        [InlineKeyboardButton(text="◀️ Назад", callback_data=f"appeals_by_employee:{year}:{month}")]
     ])
     await callback.message.edit_text(response, parse_mode="HTML", reply_markup=keyboard)
 
-@dp.callback_query(F.data == "appeals_by_client")
+@dp.callback_query(F.data.startswith("appeals_emp_nav:"))
+async def appeals_emp_nav(callback: types.CallbackQuery, state: FSMContext):
+    # appeals_emp_nav:Гришина Светлана:2026:5
+    parts = callback.data.split(":")
+    emp_name = parts[1]
+    year = int(parts[2])
+    month = int(parts[3])
+    # Просто перевызываем статистику
+    new_data = f"appeals_emp:{emp_name}:{year}:{month}"
+    callback.data = new_data
+    await appeals_employee_stats(callback, state)
+
+@dp.callback_query(F.data.startswith("appeals_by_client:"))
 async def appeals_client_stats(callback: types.CallbackQuery, state: FSMContext):
-    now = moscow_now()
-    year, month = now.year, now.month
+    parts = callback.data.split(":")
+    year = int(parts[1])
+    month = int(parts[2])
     client_stats = parser.get_client_appeals_stats(year, month)
     month_name = MONTH_NAMES_RU[month]
     response = f"📊 <b>Статистика по клиентам {month_name} {year}</b>\n\n"
     for client, data in client_stats.items():
         response += f"<b>{client}</b>\n"
         response += f"Обращения: {data['total']}\n"
-        response += f"Из них в работе: {data['in_progress']}\n"
-        response += f"Тикеты: {data['ticket']}\n"
-        if data['tickets']:
-            for date_str, responsible, url in data['tickets']:
-                try:
-                    dt = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
-                except:
-                    dt = date_str
-                response += f'<a href="{url}">[Тикет от {dt} ({responsible})]</a>\n'
+        if data['in_progress'] > 0:
+            response += f"В работе: {data['in_progress']}\n"
+        if data['ticket'] > 0:
+            response += f"Тикеты: {data['ticket']}\n"
+            if data['tickets']:
+                for date_str, responsible, url in data['tickets']:
+                    try:
+                        dt = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
+                    except:
+                        dt = date_str
+                    response += f'<a href="{url}">[Тикет от {dt} ({responsible})]</a>\n'
         response += "\n"
+
+    # Навигация для клиентов
+    now = moscow_now()
+    prev_month = month - 1 if month > 1 else 12
+    prev_year = year if month > 1 else year - 1
+    next_month = month + 1 if month < 12 else 1
+    next_year = year if month < 12 else year + 1
+
+    has_prev = len(parser.get_appeals_for_month(prev_year, prev_month)) > 0
+    future = (next_year > now.year) or (next_year == now.year and next_month > now.month)
+    has_next = (not future) and len(parser.get_appeals_for_month(next_year, next_month)) > 0
+
+    nav_buttons = []
+    if has_prev:
+        nav_buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"appeals_client_nav:{prev_year}:{prev_month}"))
+    else:
+        nav_buttons.append(InlineKeyboardButton(text=" ", callback_data="ignore"))
+    nav_buttons.append(InlineKeyboardButton(text=f"📆 {month_name} {year}", callback_data="ignore"))
+    if has_next:
+        nav_buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"appeals_client_nav:{next_year}:{next_month}"))
+    else:
+        nav_buttons.append(InlineKeyboardButton(text=" ", callback_data="ignore"))
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="appeals_back_to_summary")]
+        nav_buttons,
+        [InlineKeyboardButton(text="◀️ Назад", callback_data=f"appeals_nav:summary:{year}:{month}")]
     ])
     await callback.message.edit_text(response, parse_mode="HTML", reply_markup=keyboard)
 
-@dp.callback_query(F.data == "appeals_back_to_summary")
-async def appeals_back_to_summary(callback: types.CallbackQuery, state: FSMContext):
-    await show_appeals_summary(callback, state)
+@dp.callback_query(F.data.startswith("appeals_client_nav:"))
+async def appeals_client_nav(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    year = int(parts[1])
+    month = int(parts[2])
+    new_data = f"appeals_by_client:{year}:{month}"
+    callback.data = new_data
+    await appeals_client_stats(callback, state)
 
 @dp.message(StateFilter(UserStates.main_menu), F.text == "📊 Статистика")
 async def show_stats_button(message: types.Message, state: FSMContext):
