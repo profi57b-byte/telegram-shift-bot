@@ -1683,12 +1683,10 @@ async def appeals_employee_stats(callback: types.CallbackQuery, state: FSMContex
     stats = parser.get_employee_appeals_stats(emp_name, year, month)
 
     month_name = MONTH_NAMES_RU[month]
-    if stats['old_missing_obsidian'] > 0:
-        header = f"<b>У сотрудника есть {stats['old_missing_obsidian']} невнесённых в Obsidian обращения!</b>\n\n"
-    else:
-        header = ""
-    response = f"{header}📊 <b>Статистика обращений: {emp_name} ({month_name} {year})</b>\n\n"
+    not_added = stats['total'] - stats['added_obsidian']
+    response = f"📊 <b>Статистика обращений: {emp_name} ({month_name} {year})</b>\n\n"
     response += f"Внесено в Obsidian: <b>{stats['added_obsidian']}</b>\n"
+    response += f"Не внесено в Obsidian: <b>{not_added}</b>\n"
     response += f"В работе: <b>{stats['in_progress']}</b>\n"
     response += f"Создано тикетов: <b>{stats['ticket_created']}</b>\n"
     if stats['merge_request_urls']:
