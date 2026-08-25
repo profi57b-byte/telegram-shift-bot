@@ -20,7 +20,7 @@ class CustomHttpAdapter(HTTPAdapter):
         return super().init_poolmanager(*args, **kwargs)
 
 # ⚠️ ВАЖНО: Вставьте актуальный URL вашего веб-приложения
-GAS_URL = "https://script.google.com/macros/s/AKfycbyHlpKE1G79CV2_PC_y7YtuLQDkgk_lRhwQhU42wPcaAVAxx6Ms2Nj2hVkbI4_h-9sK/exec"
+GAS_URL = "https://script.google.com/macros/s/AKfycbxDXppaNjaZ_e2z0HkkrHkatwzsBgDJ7c0PqSOOq0DmI5WwzP2prSS-PuW3TzMdckcO/exec"
 OUTPUT_FILE = "data.json"
 INTERVAL = 15  # секунд между успешными запросами
 MAX_RETRIES = 3
