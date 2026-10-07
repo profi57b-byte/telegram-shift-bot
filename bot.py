@@ -3213,13 +3213,20 @@ async def main():
     await access_control.init_db()
     await seed_users()
 
-    # НОВОЕ: загружаем подмены из БД и применяем к расписанию
+    # Загружаем подмены из БД и применяем к расписанию
     saved_substitutions = await db.get_all_substitutions()
     if saved_substitutions:
         parser.apply_substitutions(saved_substitutions)
         logger.info(f"Восстановлено {len(saved_substitutions)} подмен из БД")
 
-    # Запускаем фоновую задачу
+    # 🔥 УДАЛЯЕМ ВЕБХУК (иначе TelegramConflictError)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Вебхук успешно удалён, старые обновления сброшены")
+    except Exception as e:
+        logger.error(f"Не удалось удалить вебхук: {e}")
+
+    # Запускаем фоновые задачи
     asyncio.create_task(reminder_checker())
     asyncio.create_task(hours_check_reminder())
     asyncio.create_task(shift_counter_updater())
