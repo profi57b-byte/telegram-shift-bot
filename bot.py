@@ -24,7 +24,7 @@ from database import UserDatabase
 from access_control import AccessControl
 
 # Конфигурация
-BOT_TOKEN = os.getenv('BOT_TOKEN', '8541386736:AAHYU7EQnp2rDeVnAXmyRVeiOUmW7I91e6A')
+BOT_TOKEN = os.getenv('BOT_TOKEN', '8541386736:AAE0HWn1g1_wzR-kR97Ia1YCToATq9_kLLk')
 LOG_CHAT_ID = '-5242231135'  # Ваш ID чата для логов
 
 # Инициализация
